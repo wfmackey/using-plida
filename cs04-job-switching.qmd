@@ -1,0 +1,322 @@
+---
+title: "Case study 4: Job switching and health shocks"
+subtitle: "Window functions after joins on billion-row data"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(duckdb); library(DBI); library(dplyr); library(dbplyr)
+  library(ggplot2); library(scales); library(tictoc); library(glue); library(fs)
+})
+```
+
+This case study is the hard one. We ask: **do people who experience a spike in health service use switch employers at higher rates?** It requires:
+
+1. Deriving _employer switches_ from STP weekly payroll data using `LAG()` window functions.
+2. Deriving _health shock_ months from MBS claims using rolling-window aggregations.
+3. Joining the two derived datasets via spine tables and comparing switching rates.
+
+Each step involves window operations on hundreds of millions of rows, partitioned by person and ordered by date. As we found on the [window strategies page](04c-window-strategies.qmd), DuckDB's window functions OOM on 700M+ rows on a 32 GB machine — so we need a strategy.
+
+## The strategy
+
+We tested two full approaches end-to-end:
+
+1. **Materialise-then-query:** load STP and MBS from parquet into a DuckDB working database, then run the window functions against native DuckDB tables. Total time: ~235 seconds.
+2. **Views over parquet:** create DuckDB views pointing at the parquet files, then run the window functions reading parquet directly. Total time: ~75 seconds.
+
+Views win by 3×. The per-query cost is slightly higher (parquet decode on each bucket), but skipping the 170-second materialisation step more than compensates. In both cases the window functions are chunked by person hash bucket — neither `LAG()` nor a self-join can handle 700M rows in one shot on 32 GB.
+
+::: {.callout-important}
+## Three rules for window functions at PLIDA scale
+1. **Chunk by person hash bucket.** ~70M rows per bucket is comfortable on 32 GB. 700M is not.
+2. **Pre-aggregate before windowing.** Person-months, not individual claims.
+3. **Use views over parquet** rather than materialising into DuckDB — unless you will query the same table many times.
+:::
+
+## Connect to the data
+
+No loading, no waiting. Just point DuckDB at the parquet files.
+
+```{r connect}
+db_path <- file.path(paths$duckdb_dir, "cs04_working.duckdb")
+if (file_exists(db_path)) file_delete(db_path)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = FALSE)
+invisible(dbExecute(con, "SET threads TO 8"))
+invisible(dbExecute(con, "SET memory_limit = '20GB'"))
+tmp_dir <- file.path(paths$offline_root, "duckdb_tmp")
+dir_create(tmp_dir)
+invisible(dbExecute(con, glue("SET temp_directory = '{tmp_dir}'")))
+
+pq <- paths$parquet_root
+
+tic("Create views over parquet")
+invisible(dbExecute(con, glue("CREATE VIEW stp AS
+  SELECT *, hash(SYNTHETIC_AEUID) % 10 AS bucket
+  FROM read_parquet('{pq}/stp/stp-fy2122*.parquet')
+  WHERE ABN_HASH_TRUNC IS NOT NULL")))
+invisible(dbExecute(con, glue("CREATE VIEW mbs AS SELECT * FROM read_parquet('{pq}/dhda-mbs/*.parquet')")))
+invisible(dbExecute(con, glue("CREATE VIEW ato_spine AS SELECT * FROM read_parquet('{pq}/ato-spine/*.parquet')")))
+invisible(dbExecute(con, glue("CREATE VIEW dhda_spine AS SELECT * FROM read_parquet('{pq}/dhda-spine/*.parquet')")))
+invisible(dbExecute(con, glue("CREATE VIEW demo AS SELECT * FROM read_parquet('{pq}/demo/*.parquet')")))
+toc()
+```
+
+Views are instant — DuckDB just records the parquet glob. The 697 million STP rows and 372 million MBS rows stay on disk until a query needs them.
+
+## Step 1: Derive employer switches from STP (chunked)
+
+An employer switch is when `ABN_HASH_TRUNC` changes from one week to the next. We use `LAG()` with `PARTITION BY person ORDER BY week` — but process 10 hash buckets independently so each fits in memory.
+
+```{r derive-switches}
+n_buckets <- 10
+
+invisible(dbExecute(con, "DROP TABLE IF EXISTS stp_switches"))
+invisible(dbExecute(con, "CREATE TABLE stp_switches (
+  SYNTHETIC_AEUID VARCHAR, WEEK_ENDING DATE,
+  new_employer VARCHAR, prev_employer VARCHAR,
+  gross_pay DOUBLE
+)"))
+
+tic("Derive employer switches (10 buckets, from parquet)")
+for (b in 0:(n_buckets - 1)) {
+  invisible(dbExecute(con, glue("
+    INSERT INTO stp_switches
+    WITH lagged AS (
+      SELECT
+        SYNTHETIC_AEUID, WEEK_ENDING, ABN_HASH_TRUNC,
+        PMT_SUMRY_TOTL_GRS_PMT_AMT AS gross_pay,
+        LAG(ABN_HASH_TRUNC) OVER (
+          PARTITION BY SYNTHETIC_AEUID ORDER BY WEEK_ENDING
+        ) AS prev_employer
+      FROM stp
+      WHERE bucket = {b}
+    )
+    SELECT SYNTHETIC_AEUID, WEEK_ENDING,
+           ABN_HASH_TRUNC, prev_employer, gross_pay
+    FROM lagged
+    WHERE prev_employer IS NOT NULL
+      AND ABN_HASH_TRUNC != prev_employer
+  ")))
+}
+toc()
+
+n_switches <- tbl(con, "stp_switches") |> summarise(n = n()) |> pull(n)
+n_switchers <- tbl(con, "stp_switches") |>
+  summarise(n = n_distinct(SYNTHETIC_AEUID)) |> pull(n)
+cat("Switches:", comma(n_switches), "across", comma(n_switchers), "people\n")
+```
+
+Each bucket reads ~70M rows from parquet, runs the `LAG()` window function (sort + scan), filters to switches, and writes the result. About 4–5 seconds per bucket, ~45 seconds total.
+
+::: {.callout-note}
+## Why chunking works
+The window function is `PARTITION BY SYNTHETIC_AEUID`. Each person's data is entirely within one hash bucket — no cross-bucket dependencies. The `bucket = {b}` filter reduces each iteration to ~70M rows, and DuckDB's sort fits in 20 GB.
+
+Without chunking, the same `LAG()` on 700M rows exceeds 24 GB and is killed — even on a fresh database with only that table in it. We tested this exhaustively: see the full [failure log](04c-window-strategies.qmd).
+:::
+
+::: {.callout-tip}
+## Self-join as an alternative to `LAG()`
+For fixed-interval lags (exactly 7 days here), you can replace `LAG()` with a self-join:
+
+```sql
+FROM stp t1
+JOIN stp t2
+  ON t1.SYNTHETIC_AEUID = t2.SYNTHETIC_AEUID
+  AND t1.WEEK_ENDING = t2.WEEK_ENDING + INTERVAL '7 days'
+WHERE t1.bucket = 0 AND t2.bucket = 0
+  AND t1.ABN_HASH_TRUNC != t2.ABN_HASH_TRUNC
+```
+
+This uses a hash join instead of a sort. At ~70M rows per bucket the timings are similar (~2–4s), but the self-join only works when the lag offset is a known, fixed time interval. `LAG()` always looks back one _row_ regardless of the time gap. For STP (weekly by construction) they give the same result; for irregular data, use `LAG()`. See the full [comparison](04c-window-strategies.qmd).
+:::
+
+## Step 2: Derive health shocks from MBS
+
+A "health shock" is a month where someone's MBS service count is at least double their trailing 3-month average. Two steps: collapse 372M claims to person-months, then apply a rolling window on the smaller table.
+
+```{r derive-monthly}
+tic("Collapse MBS to person-months (from parquet)")
+invisible(dbExecute(con, "DROP TABLE IF EXISTS mbs_monthly"))
+invisible(dbExecute(con, "
+  CREATE TABLE mbs_monthly AS
+  SELECT
+    SYNTHETIC_AEUID,
+    DATE_TRUNC('month', DOS) AS month,
+    SUM(NUMSERV) AS services,
+    SUM(FEECHARGED) AS fees,
+    COUNT(*) AS claims
+  FROM mbs
+  GROUP BY SYNTHETIC_AEUID, DATE_TRUNC('month', DOS)
+"))
+toc()
+cat("Person-months:", comma(tbl(con, "mbs_monthly") |> summarise(n = n()) |> pull(n)), "\n")
+```
+
+```{r derive-shocks}
+tic("Flag health shocks (rolling window on person-months)")
+invisible(dbExecute(con, "DROP TABLE IF EXISTS mbs_shocks"))
+invisible(dbExecute(con, "
+  CREATE TABLE mbs_shocks AS
+  WITH windowed AS (
+    SELECT
+      SYNTHETIC_AEUID, month, services,
+      AVG(services) OVER (
+        PARTITION BY SYNTHETIC_AEUID
+        ORDER BY month
+        ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+      ) AS trailing_avg
+    FROM mbs_monthly
+  )
+  SELECT SYNTHETIC_AEUID, month AS shock_month,
+         services, trailing_avg
+  FROM windowed
+  WHERE trailing_avg IS NOT NULL
+    AND trailing_avg > 0
+    AND services >= 2.0 * trailing_avg
+"))
+toc()
+
+n_shocks <- tbl(con, "mbs_shocks") |> summarise(n = n()) |> pull(n)
+n_shocked <- tbl(con, "mbs_shocks") |>
+  summarise(n = n_distinct(SYNTHETIC_AEUID)) |> pull(n)
+cat("Health shock events:", comma(n_shocks),
+    "across", comma(n_shocked), "people\n")
+```
+
+::: {.callout-note}
+## Pre-aggregate, then window
+Collapsing 372M claims to ~206M person-months before windowing is what makes this step feasible. The rolling window runs on 206M rows, which fits in DuckDB's memory budget for the sort. Running the window directly on 372M raw claims would risk the same OOM we hit with STP.
+:::
+
+## Step 3: Link switches to shocks via spine
+
+STP uses ATO identifiers; MBS uses DHDA identifiers. The spine tables bridge them via shared `spine_id`.
+
+```{r link}
+tic("Cross-spine join: switches x shocks")
+post_shock <- dbGetQuery(con, "
+  WITH crosswalk AS (
+    SELECT a.SYNTHETIC_AEUID AS ato_aeuid,
+           d.SYNTHETIC_AEUID AS dhda_aeuid
+    FROM ato_spine a
+    JOIN dhda_spine d USING (spine_id)
+  )
+  SELECT
+    DATE_TRUNC('month', s.WEEK_ENDING) AS switch_month,
+    COUNT(*) AS switches_post_shock,
+    COUNT(DISTINCT s.SYNTHETIC_AEUID) AS people
+  FROM stp_switches s
+  JOIN crosswalk c ON s.SYNTHETIC_AEUID = c.ato_aeuid
+  JOIN mbs_shocks h ON c.dhda_aeuid = h.SYNTHETIC_AEUID
+  WHERE s.WEEK_ENDING >= h.shock_month
+    AND s.WEEK_ENDING < h.shock_month + INTERVAL '3 months'
+  GROUP BY switch_month
+  ORDER BY switch_month
+")
+toc()
+post_shock
+```
+
+For temporal matching without a full join, DuckDB's **ASOF JOIN** is an alternative — it finds the nearest health record before each switch without materialising a windowed timeline on either side:
+
+```sql
+SELECT s.*, h.services, h.trailing_avg
+FROM stp_switches s
+ASOF JOIN mbs_monthly h
+  ON s.SYNTHETIC_AEUID = h.SYNTHETIC_AEUID
+  AND s.WEEK_ENDING >= h.month
+```
+
+## Plot
+
+```{r baseline}
+tic("Baseline switching rate")
+baseline <- tbl(con, "stp_switches") |>
+  mutate(switch_month = sql("DATE_TRUNC('month', WEEK_ENDING)")) |>
+  group_by(switch_month) |>
+  summarise(switches = n(),
+            people = n_distinct(SYNTHETIC_AEUID),
+            .groups = "drop") |>
+  collect()
+toc()
+```
+
+```{r plot}
+#| fig-width: 8
+#| fig-height: 5
+if (nrow(baseline) > 0 && nrow(post_shock) > 0) {
+  bind_rows(
+    baseline |> mutate(group = "All switchers", month = as.Date(switch_month),
+                       n = switches) |> select(month, n, group),
+    post_shock |> mutate(group = "Post health-shock (3-month window)",
+                         month = as.Date(switch_month),
+                         n = switches_post_shock) |> select(month, n, group)
+  ) |>
+    ggplot(aes(month, n, colour = group)) +
+    geom_line(linewidth = 0.6) +
+    scale_y_continuous(labels = label_comma()) +
+    labs(x = NULL, y = "Employer switches", colour = NULL,
+         title = "Employer switches: post-health-shock vs all workers",
+         subtitle = "STP FY2122 x MBS 2015, fplida synthetic data") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom")
+} else {
+  cat("No switches detected — expected with synthetic data that does not model job mobility.\n")
+  cat("The code, strategy, and timings above are the deliverable of this case study.\n")
+}
+```
+
+::: {.callout-note}
+## Synthetic data limitation
+The `fplida` synthetic data does not model job switching — each person keeps the same employer throughout. So the switch count is 0. The pipeline design, memory management, and timings are real; the _results_ would be meaningful on actual PLIDA data where people do change jobs.
+:::
+
+## What it cost
+
+```{r summary-table}
+#| echo: false
+tibble::tribble(
+  ~step,                                      ~approach,                              ~time,
+  "Set up views over parquet",                "CREATE VIEW ... read_parquet()",        "instant",
+  "Derive employer switches (STP)",           "Chunked LAG, 10 person-hash buckets",  "~45s",
+  "Collapse MBS to person-months",            "GROUP BY from parquet view",            "~20s",
+  "Flag health shocks",                       "Rolling AVG OVER on person-months",     "~10s",
+  "Cross-spine join: switches x shocks",      "Hash join via crosswalk",               "<1s",
+) |>
+  knitr::kable(col.names = c("Step", "Approach", "Time"))
+```
+
+Total: about 75 seconds. None of the steps exceeded 20 GB of RAM. The same pipeline against materialised DuckDB tables takes ~235 seconds (the 170-second load dominates). Views over parquet are the right default when you're running the pipeline once; materialise only if you'll re-query the same table many times.
+
+## Why we chose this approach
+
+We tried four approaches before settling on views + chunked `LAG()`. All of them — and the reason each failed or succeeded — are documented on the [window strategies page](04c-window-strategies.qmd):
+
+- `LAG()` on 700M rows: OOM (sort exceeds 24 GB)
+- Self-join on 700M rows: OOM (hash table exceeds 24 GB)
+- `LAG()` on 70M rows (1 bucket): 2.3 seconds, success
+- Self-join on 70M rows: 2.0 seconds, success
+- Chunked self-join, 10 buckets: 20 seconds, success
+- Chunked `LAG()` on parquet views, 10 buckets: 45 seconds, success
+- **Views + chunked `LAG()`**: 75 seconds end-to-end, best total time
+
+## When SQL is clearer than dplyr
+
+The window-function steps use raw SQL via `dbExecute()`. This is deliberate:
+
+- `ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING` has no natural dplyr equivalent.
+- `DATE_TRUNC()` is a DuckDB function with no dplyr translation.
+- The chunking loop with `glue::glue()` is cleaner in SQL.
+
+The downstream aggregation and plotting go back to dplyr/dbplyr. Use each tool where it's strongest.
+
+```{r disconnect}
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+file_delete(db_path)
+```

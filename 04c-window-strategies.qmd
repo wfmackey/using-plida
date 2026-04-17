@@ -1,0 +1,212 @@
+---
+title: "Window function strategies on billion-row data"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(fs); library(knitr); library(scales); library(ggplot2)
+})
+```
+
+Window functions are the bread and butter of panel data work. "Did this person change employer?" is `LAG()`. "What's their rolling average income?" is `AVG() OVER (ROWS ...)`. "When did their health service use spike?" is a windowed comparison to a trailing mean.
+
+On small data, you write the window function and move on. On PLIDA-scale data — 3.5 billion STP rows across 30 million people — you hit hard memory limits that force a different approach. This page documents what we tried, what failed, and what works.
+
+## The task
+
+Detect employer switches in STP: a person whose `ABN_HASH_TRUNC` (employer identifier) changes from one week to the next.
+
+We have 697 million rows for a single financial year (FY2122), or 3.5 billion across all 5 years. The machine has 32 GB RAM, with 24 GB allocated to DuckDB.
+
+## What we tried and what happened
+
+### Attempt 1: `LAG()` on the full table
+
+The textbook approach:
+
+```sql
+CREATE TABLE switches AS
+WITH lagged AS (
+  SELECT *,
+    LAG(ABN_HASH_TRUNC) OVER (
+      PARTITION BY SYNTHETIC_AEUID
+      ORDER BY WEEK_ENDING
+    ) AS prev_employer
+  FROM stp
+)
+SELECT * FROM lagged
+WHERE prev_employer IS NOT NULL
+  AND ABN_HASH_TRUNC != prev_employer;
+```
+
+**Result: out of memory.** DuckDB tried to sort 3.5 billion rows, spilled 166 GB to disk, and ran out of disk space.
+
+### Attempt 2: `LAG()` on 1 year (700M rows)
+
+Filtered to FY2122 only, materialised as a separate table first.
+
+**Result: out of memory.** Even on a fresh DuckDB database with only 5.5 GB of data, the `LAG()` window function exceeded 24 GB of RAM trying to sort and materialise 700M rows across 30M partitions.
+
+### Attempt 3: Self-join on 1 year (700M rows)
+
+Instead of `LAG()`, join the table to itself on `(person, week = week + 7 days)`:
+
+```sql
+SELECT t1.SYNTHETIC_AEUID, t1.WEEK_ENDING,
+       t1.ABN_HASH_TRUNC AS new_employer,
+       t2.ABN_HASH_TRUNC AS prev_employer
+FROM stp_1yr t1
+INNER JOIN stp_1yr t2
+  ON t1.SYNTHETIC_AEUID = t2.SYNTHETIC_AEUID
+  AND t1.WEEK_ENDING = t2.WEEK_ENDING + INTERVAL '7 days'
+WHERE t1.ABN_HASH_TRUNC != t2.ABN_HASH_TRUNC;
+```
+
+**Result: out of memory.** The hash table for 700M rows still exceeded 24 GB.
+
+::: {.callout-important}
+## The hard lesson
+On a 32 GB machine, **neither `LAG()` nor a self-join can process 700M rows in one shot.** LAG fails because the sort is too large. The self-join fails because the hash table is too large. The scale of person-week PLIDA data breaks both approaches at the table level.
+:::
+
+### Attempt 4: Chunk by person hash bucket
+
+Partition people into 10 buckets using `hash(SYNTHETIC_AEUID) % 10`. Process each bucket independently. Each bucket has ~70M rows — well within the 24 GB memory budget.
+
+```sql
+-- Add a bucket column at ingest
+CREATE TABLE stp_1yr AS
+SELECT *, hash(SYNTHETIC_AEUID) % 10 AS bucket
+FROM read_parquet('stp/stp-fy2122*.parquet')
+WHERE ABN_HASH_TRUNC IS NOT NULL;
+
+-- Process one bucket at a time
+-- (LAG version)
+INSERT INTO switches
+WITH lagged AS (
+  SELECT *, LAG(ABN_HASH_TRUNC) OVER (
+    PARTITION BY SYNTHETIC_AEUID ORDER BY WEEK_ENDING
+  ) AS prev_employer
+  FROM stp_1yr WHERE bucket = 0
+)
+SELECT ... FROM lagged
+WHERE ABN_HASH_TRUNC != prev_employer;
+
+-- (Self-join version)
+INSERT INTO switches
+SELECT t1.*, t2.ABN_HASH_TRUNC AS prev_employer
+FROM stp_1yr t1
+INNER JOIN stp_1yr t2
+  ON t1.SYNTHETIC_AEUID = t2.SYNTHETIC_AEUID
+  AND t1.WEEK_ENDING = t2.WEEK_ENDING + INTERVAL '7 days'
+WHERE t1.bucket = 0 AND t2.bucket = 0
+  AND t1.ABN_HASH_TRUNC != t2.ABN_HASH_TRUNC;
+```
+
+**Result: success.**
+
+| | Per bucket | All 10 buckets |
+|---|---|---|
+| **LAG** | 2.3 s | ~23 s (projected) |
+| **Self-join** | 2.0 s | **20.0 s** (measured) |
+
+At 70M rows per bucket, both `LAG()` and the self-join complete in about 2 seconds. Processing all 10 buckets sequentially takes 20 seconds for the full 700M-row year. Extrapolating to all 5 years: about 100 seconds for the entire 3.5 billion row STP corpus.
+
+## How the self-join works
+
+The self-join is worth understanding even though it's not faster than `LAG()` at the same scale — because it works differently, and in some contexts that matters.
+
+`LAG()` says "for each row, look back one _position_ within this person's timeline." To define "one position back", DuckDB must **sort all rows** by `(person, week)`. That's O(N log N).
+
+The self-join says "for each row, find the row for the same person exactly one _week_ earlier." DuckDB builds a **hash table** on `(person, week)` and probes it. That's O(N).
+
+Visually, for one person's timeline:
+
+```
+Week     | Employer | LAG() sees      | Self-join matches
+---------|----------|-----------------|-------------------
+Week 1   | A        | NULL            | no match (no Week 0)
+Week 2   | A        | A (from Wk 1)   | A (from Wk 1)
+Week 3   | B        | A (from Wk 2)   | A (from Wk 2)  ← SWITCH
+Week 4   | B        | B (from Wk 3)   | B (from Wk 3)
+```
+
+Both detect the A → B switch at Week 3.
+
+::: {.callout-note}
+## When can you use a self-join instead of `LAG()`?
+The self-join works when the lag has a **known, fixed time offset** — here, exactly 7 days. If your data has irregular spacing (some people have records every week, others every fortnight), the self-join will miss non-standard gaps. `LAG()` always looks back one _row_ regardless of the time gap. For STP, where records are weekly by construction, they give the same result.
+:::
+
+## The pattern: chunk by person
+
+The general recipe for window functions on person-week PLIDA data:
+
+```r
+library(duckdb); library(DBI); library(dplyr); library(dbplyr)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "my.duckdb", read_only = FALSE)
+dbExecute(con, "SET memory_limit = '20GB'")
+
+n_buckets <- 10
+
+# Create the output table
+dbExecute(con, "CREATE TABLE switches (
+  SYNTHETIC_AEUID VARCHAR, WEEK_ENDING DATE,
+  new_employer VARCHAR, prev_employer VARCHAR)")
+
+for (b in 0:(n_buckets - 1)) {
+  dbExecute(con, glue::glue("
+    INSERT INTO switches
+    WITH lagged AS (
+      SELECT *, LAG(ABN_HASH_TRUNC) OVER (
+        PARTITION BY SYNTHETIC_AEUID ORDER BY WEEK_ENDING
+      ) AS prev_employer
+      FROM stp WHERE hash(SYNTHETIC_AEUID) % {n_buckets} = {b}
+    )
+    SELECT SYNTHETIC_AEUID, WEEK_ENDING,
+           ABN_HASH_TRUNC, prev_employer
+    FROM lagged
+    WHERE prev_employer IS NOT NULL
+      AND ABN_HASH_TRUNC != prev_employer
+  "))
+}
+```
+
+The `hash(...) % n_buckets` filter means each iteration processes only 1/n of the people. Because the window function is `PARTITION BY person`, each person's partition is entirely within one bucket — no cross-bucket issues, no edge effects.
+
+::: {.callout-tip}
+## Choosing the number of buckets
+The goal is to keep each bucket small enough that the window function's intermediate state fits in your `memory_limit`. On this machine: 700M rows in 10 buckets = 70M rows per bucket, which fits in 24 GB. A safe rule of thumb: aim for 50–100M rows per bucket. More buckets = more iterations but safer memory. Fewer = fewer iterations but closer to the limit.
+:::
+
+## Sizing guidance
+
+Based on our tests:
+
+| Rows per operation | 32 GB machine (24 GB to DuckDB) | Status |
+|---|---|---|
+| ~70M | 2s per window function | Comfortable |
+| ~200M | Untested, likely works | Try it |
+| ~700M | OOM for both LAG and self-join | Too many |
+| ~3.5B | OOM, disk spill exceeded 166 GB | Way too many |
+
+## What about ASOF joins?
+
+For the cross-dataset version of this problem — "find the most recent health service before each job switch" — DuckDB's ASOF join is often better than windowing both tables and then joining. It directly finds the nearest temporal match:
+
+```sql
+SELECT s.*, h.services, h.fees
+FROM switches s
+ASOF JOIN mbs_monthly h
+  ON s.SYNTHETIC_AEUID = h.SYNTHETIC_AEUID
+  AND s.WEEK_ENDING >= h.month;
+```
+
+This avoids computing a windowed timeline on the MBS side entirely. See the [DuckDB ASOF join docs](https://duckdb.org/docs/sql/query_syntax/from.html#asof-joins) for the full syntax.
+
+## Beyond DuckDB
+
+For production pipelines that need to process this data daily, the next step beyond chunked DuckDB is a custom **streaming processor in Rust** called from R via [extendr](https://extendr.github.io/rextendr/). A reader that walks sorted parquet files and maintains `(current_person, previous_employer)` state uses O(1) memory and runs at disk speed — no sorting, no hash tables, no chunking. This is overkill for exploratory analysis but the right tool for a pipeline that runs on every data refresh.

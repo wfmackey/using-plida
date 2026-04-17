@@ -1,0 +1,107 @@
+---
+title: "CSV to parquet"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(fs); library(ggplot2); library(scales); library(knitr)
+})
+log_path <- file.path(paths$bench_dir, "convert-log.parquet")
+convert_log <- if (file_exists(log_path)) read_parquet(log_path) else tibble()
+```
+
+## Should CSV become parquet before use?
+
+Yes — essentially always. The argument is boring and overwhelming:
+
+- **Schema.** CSV has no types. Every read has to either guess or be handed a schema. Parquet stores the schema with the file.
+- **Columnar I/O.** PLIDA-style tables have dozens to hundreds of columns but most queries touch a handful. Parquet lets the reader fetch only those columns; CSV forces a full row scan.
+- **Compression.** ZSTD-compressed parquet is typically half the size of the raw CSV. On this corpus we see the 44.5 GB MBS 2015 file shrink to 18.7 GB — and that version is simultaneously faster to read.
+- **Row groups and zonemaps.** Parquet stores per-row-group statistics. If you filter on `INCM_YR = 2014`, DuckDB/arrow can skip entire row groups whose min/max for `INCM_YR` does not overlap 2014.
+- **Interop.** Every engine we care about — arrow, duckdb, polars, pandas, pyarrow — reads parquet natively. CSV has a thousand dialects.
+
+The only reason _not_ to convert is if the file is too small to bother, and in that case the conversion is free anyway.
+
+## How we convert without running out of memory
+
+A naive `readr::read_csv()` on the 44.5 GB MBS 2015 file is out of the question on 32 GB of RAM. The right idiom is to **stream** the file: open it as an arrow CSV dataset (which only parses in batches), and hand those batches straight to a parquet writer.
+
+```r
+library(arrow)
+library(fs)
+
+ds <- open_csv_dataset("dhda-mbs/madipge-mbs-d-claims-2015.csv")
+write_dataset(
+  ds,
+  path = "/offline/using-plida-data/parquet/dhda-mbs",
+  format = "parquet",
+  basename_template = "mbs-2015-{i}.parquet",
+  max_rows_per_file = 5e6,
+  existing_data_behavior = "overwrite"
+)
+```
+
+Four details in that snippet are worth spelling out:
+
+1.  **`open_csv_dataset`** is lazy. Nothing is read until the writer pulls from it. This is what keeps memory flat.
+2.  **`max_rows_per_file = 5e6`** caps the parquet file size so downstream tools (DuckDB, arrow) can parallelise the read and skip row groups. Without this you get one enormous parquet file.
+3.  **`existing_data_behavior = "overwrite"`** — note the bare `"overwrite"`, not `"overwrite_or_ignore"`. Earlier arrow versions used the longer name; current arrow accepts only `"overwrite"`, `"error"`, or `"delete_matching"`. Every conversion job silently failing for an 8 ms "arg should be one of..." error was my first bug of the day.
+4.  Arrow is **not doing column selection** here — it is writing every column. For subset-before-convert you would use `ds |> select(...) |> write_dataset(...)` — arrow will push the projection into the CSV scan.
+
+## The numbers
+
+```{r convert-table}
+#| echo: false
+if (nrow(convert_log) > 0) {
+  convert_log |>
+    filter(!is.na(seconds), !is.na(csv_gb)) |>
+    transmute(
+      label,
+      file,
+      csv_gb     = round(csv_gb, 2),
+      parquet_gb = round(parquet_gb, 2),
+      ratio      = round(parquet_gb / csv_gb, 2),
+      seconds    = round(seconds, 1),
+      peak_rss_gb = round(rss_peak_gb, 2)
+    ) |>
+    arrange(desc(csv_gb)) |>
+    head(15) |>
+    kable()
+} else {
+  cat("(convert log not yet available — run R/01-convert-csv-to-parquet.R)")
+}
+```
+
+The headline row is the 44.5 GB MBS 2015 file converted to 18.7 GB of parquet in about 2 minutes with peak resident-set size under 2 GB. That is the whole point of streaming: the file is an order of magnitude larger than the memory budget, and the budget never flinches.
+
+```{r convert-plot}
+#| echo: false
+#| fig-width: 7
+#| fig-height: 4
+if (nrow(convert_log) > 0) {
+  convert_log |>
+    filter(!is.na(seconds), !is.na(csv_gb)) |>
+    ggplot(aes(csv_gb, seconds)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.4) +
+    scale_x_continuous("CSV size (GB)", trans = "log10") +
+    scale_y_continuous("Conversion time (s)", trans = "log10") +
+    labs(title = "Conversion time scales linearly with CSV size",
+         subtitle = "arrow streaming; zstd parquet; 8 threads") +
+    theme_minimal(base_size = 11)
+}
+```
+
+Across the 80-plus files we converted, wall time is essentially linear in CSV size at about 2-3 seconds per GB. Peak RSS stays near 2 GB regardless of input size. Parquet is roughly half the CSV size.
+
+## What about the CSV-to-DuckDB direct path?
+
+DuckDB can ingest CSV directly with `read_csv_auto` or `COPY ... FROM 'x.csv'`, so in principle you could skip the parquet intermediate and go straight from CSV to DuckDB-native storage. I do not recommend it for this kind of project, for three reasons:
+
+1.  Parquet is a useful artefact on its own — other tools (arrow, polars, pyarrow) can read it without a DuckDB connection.
+2.  Ingesting CSV-to-DuckDB-table takes the same time as CSV-to-parquet plus parquet-to-DuckDB-table, and you end up with only the DuckDB copy.
+3.  If your DuckDB file ever corrupts or you want to reshard the database, you have to re-read the CSVs. With parquet in place, the DuckDB rebuild is cheap.
+
+The one exception is when you know you will only ever use DuckDB and the CSVs are small enough that a single-shot ingest is fine — then `COPY ... FROM ...` is slightly more convenient.

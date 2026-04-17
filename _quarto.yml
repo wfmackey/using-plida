@@ -1,0 +1,50 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "Using PLIDA: larger-than-memory data in R"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Overview
+      - href: 01-the-data.qmd
+        text: The data
+      - href: 02-csv-to-parquet.qmd
+        text: CSV to Parquet
+      - href: 03-duckdb.qmd
+        text: DuckDB
+      - href: 04-benchmarks.qmd
+        text: Benchmarks
+      - href: 04b-storage-layout.qmd
+        text: Storage layout
+      - href: 04c-window-strategies.qmd
+        text: Window strategies
+      - href: 05-recommendations.qmd
+        text: Recommendations
+      - text: "---"
+      - text: Case studies
+        menu:
+          - href: cs01-earnings.qmd
+            text: "CS1: How much do people earn?"
+          - href: cs02-health-services.qmd
+            text: "CS2: Who uses health services?"
+          - href: cs03-csv-to-chart.qmd
+            text: "CS3: CSV to chart in 20 minutes"
+          - href: cs04-job-switching.qmd
+            text: "CS4: Job switching and health shocks"
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+    self-contained-math: true
+
+execute:
+  freeze: auto
+  warning: false
+  message: false

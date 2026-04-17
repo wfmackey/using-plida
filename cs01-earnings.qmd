@@ -1,0 +1,138 @@
+---
+title: "Case study 1: How much do people earn?"
+subtitle: "A single-table workflow on individual tax returns"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(duckdb); library(DBI); library(dplyr); library(dbplyr)
+  library(ggplot2); library(scales); library(tictoc)
+})
+
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
+  read_only = TRUE
+)
+```
+
+This case study works through a simple question: **what does the distribution of occupation groups look like in the individual tax returns?** It uses only the `itr` table — no joins, no spine files, just filtering and aggregating one big table. If you're picking up PLIDA for the first time, start here.
+
+## Connect to DuckDB
+
+If you've run through the [setup steps](05-recommendations.qmd), you have a DuckDB database with the ITR data loaded. Open a read-only connection:
+
+```{r connect}
+itr <- tbl(con, "itr")
+```
+
+`itr` is now a lazy dbplyr table. Nothing has been read into memory — you can work with it like a tibble, but the computation happens in DuckDB.
+
+::: {.callout-note}
+## Why `read_only = TRUE`?
+By default DuckDB locks the database file for exclusive access. If you open it read-write in your R console and then try to render a Quarto doc that also opens it, one of them will fail. Read-only connections can be shared across sessions.
+:::
+
+```{r glimpse}
+glimpse(itr)
+```
+
+Six columns, about 170 million rows across all financial years. `INCM_YR` is the financial year and `OCPTN_GRP_CD` is a 4-digit ANZSCO occupation code. This context table doesn't have taxable income directly — a common PLIDA experience: the column you want is in a different file. But we can do plenty with what we have.
+
+## Count taxpayers by occupation group over time
+
+How many people file a tax return each year, broken down by ANZSCO major group (the first digit of the occupation code)?
+
+```{r count-by-year}
+tic("Groupby on 170M rows")
+occ_by_year <- itr |>
+  filter(!is.na(OCPTN_GRP_CD)) |>
+  mutate(occ_major = OCPTN_GRP_CD %/% 1000L) |>
+  group_by(INCM_YR, occ_major) |>
+  summarise(n = n(), .groups = "drop") |>
+  collect()
+toc()
+
+occ_by_year
+```
+
+Everything up to `collect()` is lazy — the dplyr chain builds a SQL query that DuckDB executes. 170 million input rows collapse to a few hundred output rows. That is the pattern: push the heavy work to DuckDB, `collect()` only when the result fits in memory.
+
+::: {.callout-tip}
+## The golden rule of dbplyr
+`collect()` only when the result is small. If you find yourself wanting to `collect()` and _then_ `filter()`, you have it backwards.
+:::
+
+Here is the SQL that dbplyr generated:
+
+```{r show-query}
+itr |>
+  filter(!is.na(OCPTN_GRP_CD)) |>
+  mutate(occ_major = OCPTN_GRP_CD %/% 1000L) |>
+  group_by(INCM_YR, occ_major) |>
+  summarise(n = n(), .groups = "drop") |>
+  show_query()
+```
+
+If you know SQL, this is useful for debugging. If you don't, the dplyr verbs are what matter — `show_query()` is there when you need it.
+
+## Plot
+
+Once you've `collect()`ed, you're back in normal R-land.
+
+```{r plot-occ-year}
+#| fig-width: 8
+#| fig-height: 5
+occ_labels <- c(
+  "1" = "Managers", "2" = "Professionals", "3" = "Technicians",
+  "4" = "Community/personal", "5" = "Clerical/admin",
+  "6" = "Sales", "7" = "Machinery operators", "8" = "Labourers"
+)
+
+occ_by_year |>
+  filter(occ_major %in% 1:8) |>
+  mutate(occ_label = occ_labels[as.character(occ_major)]) |>
+  ggplot(aes(INCM_YR, n, colour = occ_label)) +
+  geom_line(linewidth = 0.6) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(x = "Income year", y = "Tax returns filed",
+       colour = "ANZSCO major group",
+       title = "Tax returns by occupation group over time",
+       subtitle = "fplida synthetic data, 30M person corpus") +
+  theme_minimal(base_size = 11)
+```
+
+## What just happened
+
+You queried 170 million rows, grouped by two variables, and plotted the result — without loading the data into R memory. The same operation with `read_parquet()` and dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM (see [benchmarks](04-benchmarks.qmd)). On a smaller machine it would crash.
+
+::: {.callout-important}
+## The comparison that matters
+The same groupby on 170M rows: **dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM. DuckDB via dbplyr takes 0.16 seconds and 0.25 GB.** See the full [benchmark results](04-benchmarks.qmd).
+:::
+
+The workflow is always:
+
+1.  `tbl(con, "table_name")` to get a lazy handle.
+2.  dplyr verbs to build the query.
+3.  `collect()` to pull the (small) result into R.
+4.  ggplot2 from there.
+
+## A note on `sql()`
+
+Occasionally dbplyr generates something that doesn't translate cleanly. When that happens, drop into raw SQL inside the pipe:
+
+```r
+itr |>
+  mutate(occ_major = sql("OCPTN_GRP_CD / 1000")) |>
+  ...
+```
+
+Try the dplyr version first — it usually works. `sql()` is the fallback.
+
+```{r disconnect}
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+```

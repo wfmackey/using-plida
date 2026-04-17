@@ -1,0 +1,33 @@
+---
+title: "Using PLIDA: larger-than-memory data in R"
+author: "Will Mackey"
+---
+
+## What this site is
+
+A worked demonstration of modern R data-engineering tools — [arrow](https://arrow.apache.org/docs/r/), [duckdb](https://duckdb.org/docs/api/r) / [dbplyr](https://dbplyr.tidyverse.org/), [data.table](https://rdatatable.gitlab.io/data.table/), and base [dplyr](https://dplyr.tidyverse.org/) — applied to PLIDA-style administrative microdata that is much larger than the machine's RAM. All code runs on a 32 GB MacBook against a ~750 GB synthetic PLIDA corpus produced by the [`fplida`](https://github.com/wfmackey/fplida) package.
+
+The site answers four practical questions:
+
+1.  Should CSVs be processed and stored as parquet before use?
+2.  Is it worth building a DuckDB database from the parquet files first, or should we just query the parquet with views?
+3.  Once the data is in place, which R idiom should you reach for — dplyr-on-tibbles, data.table, arrow, or dbplyr-over-DuckDB?
+4.  How do we do all of this without crashing a 32 GB RAM machine?
+
+## The short answer
+
+If you read only the recommendations page: convert CSV to parquet with arrow streaming, load the parquet into a DuckDB database, and do everything else with `dbplyr` over that DuckDB connection. Fall back to `arrow::open_dataset` for ad-hoc exploration where spinning up a database is overkill, and reach for `data.table` only after you have filtered down to something that fits comfortably in memory.
+
+The rest of the site shows how we got there, with timings and memory footprints from real (synthetic) runs.
+
+## How the pages fit together
+
+- [The data](01-the-data.qmd) — what the fplida corpus looks like, which tables we use, and the join model.
+- [CSV to parquet](02-csv-to-parquet.qmd) — how arrow streams a 44.5 GB CSV through a 2 GB memory footprint, and the cost/benefit of the conversion.
+- [DuckDB](03-duckdb.qmd) — two ways to wire parquet up to DuckDB (views vs materialised tables), and the build cost of each.
+- [Benchmarks](04-benchmarks.qmd) — five backends, three canonical tasks, timings and peak RSS.
+- [Recommendations](05-recommendations.qmd) — the rule of thumb, with caveats.
+
+## Reproducibility
+
+All source data lives outside this repository at `/Users/willmackey/offline/fplida-data/fplida_30m_csv/` (synthetic, produced by `fplida`). All intermediate parquet and DuckDB files live at `/Users/willmackey/offline/using-plida-data/` so the project folder stays small. The scripts in `R/` are numbered in dependency order; `R/01-convert-csv-to-parquet.R` runs first, then `R/01b-convert-supplementary.R`, `R/02-build-duckdb.R`, and finally `R/04-run-benchmarks.R`.
