@@ -3,6 +3,11 @@ title: "Using PLIDA: larger-than-memory data in R"
 author: "Will Mackey"
 ---
 
+::: {.callout-warning}
+## Draft
+This site is a work in progress. The code, benchmarks, and recommendations are still being tested and may change. Don't rely on anything here yet.
+:::
+
 ## What this site is
 
 A worked demonstration of modern R data-engineering tools — [arrow](https://arrow.apache.org/docs/r/), [duckdb](https://duckdb.org/docs/api/r) / [dbplyr](https://dbplyr.tidyverse.org/), [data.table](https://rdatatable.gitlab.io/data.table/), and base [dplyr](https://dplyr.tidyverse.org/) — applied to PLIDA-style administrative microdata that is much larger than the machine's RAM. All code runs on a 32 GB MacBook against a ~750 GB synthetic PLIDA corpus produced by the [`fplida`](https://github.com/wfmackey/fplida) package.

@@ -1,0 +1,107 @@
+---
+title: "Setup"
+---
+
+Before running anything on this site, you need two things: the synthetic data, and a place to put intermediate files. This page walks through both.
+
+## Step 1: Install fplida
+
+[`fplida`](https://github.com/wfmackey/fplida) is an R package with a Rust backend that generates synthetic data mirroring PLIDA's structure. It produces realistic, cross-dataset-consistent microdata for 34 administrative and survey datasets — everything from Census and tax returns to MBS claims and STP payroll.
+
+```bash
+# Requires R 4.5+ and Rust 1.68+ (via rustup)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Clone and install
+git clone https://github.com/wfmackey/fplida.git
+R CMD INSTALL fplida/
+```
+
+## Step 2: Generate the data
+
+The size you generate depends on what you want to test. The case studies on this site use 30 million people (~750 GB of CSV), but you can start much smaller:
+
+| People | Approx CSV size | Approx parquet size | Good for |
+|--------|----------------|--------------------|----|
+| 100K | ~2.5 GB | ~500 MB | Quick testing, learning the API |
+| 1M | ~25 GB | ~5 GB | Realistic single-table workflows |
+| 10M | ~250 GB | ~50 GB | Join and window function testing |
+| 30M | ~750 GB | ~130 GB | Full PLIDA-scale stress testing |
+
+fplida can write parquet directly (recommended) or CSV:
+
+```r
+library(fplida)
+
+# Generate at your chosen scale — parquet is faster and smaller
+result <- build_fplida(
+  n = 1000000,
+  export_format = "parquet",
+  output_dir = "/path/to/your/fplida-data"
+)
+
+# Or CSV if you want to follow the CSV-to-parquet conversion steps on this site
+result <- build_fplida(
+  n = 1000000,
+  export_format = "csv",
+  output_dir = "/path/to/your/fplida-data"
+)
+```
+
+The output is a directory tree with one subfolder per dataset (e.g. `ato-pit_itr/`, `dhda-mbs/`, `abs-core/`), each containing data files and a spine file that maps `spine_id` to that agency's person identifier.
+
+::: {.callout-tip}
+## Start small
+If you just want to follow along with the case studies, 1 million people is enough to see the patterns. The timings and memory numbers on this site are from a 30M run — yours will be proportionally smaller, but the code is the same.
+:::
+
+## Step 3: Set your paths
+
+Everything on this site reads data from two locations:
+
+- **`fplida_path`**: where fplida wrote its output (the directory containing `ato-pit_itr/`, `dhda-mbs/`, etc.)
+- **`work_path`**: where this project stores intermediate files (parquet conversions, DuckDB databases). This should be on a drive with plenty of space — at 30M people, expect ~200 GB of intermediates.
+
+Open `R/_common.R` and edit the two paths:
+
+```r
+# R/_common.R — edit these to match your setup
+fplida_path <- "/path/to/your/fplida-data"
+work_path   <- "/path/to/your/working-directory"
+```
+
+Every script and `.qmd` file on this site sources `R/00-paths.R`, which reads `R/_common.R` and builds the full path structure from those two variables. You set them once; everything else follows.
+
+`R/_common.R` is in `.gitignore` so your local paths don't get committed.
+
+::: {.callout-note}
+## Alternative: environment variables
+If you prefer, add these to your `.Renviron` instead of editing `R/_common.R`:
+
+```
+FPLIDA_PATH=/path/to/your/fplida-data
+USING_PLIDA_WORK_PATH=/path/to/your/working-directory
+```
+
+`R/00-paths.R` checks for these as a fallback.
+:::
+
+## Step 4: Install R packages
+
+The case studies use these packages:
+
+```r
+install.packages(c(
+  "duckdb", "duckplyr", "arrow", "dbplyr",
+  "dplyr", "tidyverse", "data.table", "dtplyr",
+  "ggplot2", "scales", "tictoc", "fs", "glue", "here"
+))
+```
+
+## What's next
+
+With the data generated and paths set, you're ready to go:
+
+- If you generated **CSV**, start with [CSV to parquet](02-csv-to-parquet.qmd) to convert your data.
+- If you generated **parquet** directly, skip to [DuckDB](03-duckdb.qmd) to build the database.
+- If you just want to see what this is all about, read the [case studies](cs01-earnings.qmd).

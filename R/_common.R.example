@@ -1,0 +1,5 @@
+# User-specific paths. Copy this file to R/_common.R and edit.
+# See 00-setup.qmd for instructions.
+
+fplida_path <- "/path/to/your/fplida-data"
+work_path   <- "/path/to/your/working-directory"

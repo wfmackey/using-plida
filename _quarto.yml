@@ -8,6 +8,8 @@ website:
     left:
       - href: index.qmd
         text: Overview
+      - href: 00-setup.qmd
+        text: Setup
       - href: 01-the-data.qmd
         text: The data
       - href: 02-csv-to-parquet.qmd
