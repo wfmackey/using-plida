@@ -125,7 +125,12 @@ Integer joins are [about 2× faster](04b-storage-layout.qmd) than string joins. 
 
 ## Step 4: Query with dbplyr
 
-Now you are in the pleasant part. Open a _read-only_ connection (so multiple R sessions can share it) and use dplyr verbs as usual:
+Now you are in the pleasant part. Open a _read-only_ connection (so multiple R sessions can share it) and use dplyr verbs as usual.
+
+::: {.callout-note}
+## Why dbplyr here, not duckplyr?
+For single-table work (like [case study 1](cs01-earnings.qmd)), duckplyr reads parquet directly with no setup — that's the fastest path for groupbys and filters. But for multi-table joins at PLIDA scale (30M people × 372M MBS claims), duckplyr's in-memory engine runs out of memory on a 32 GB machine. dbplyr with a DBI connection to the materialised `.duckdb` file lets DuckDB page through its native storage efficiently. The rule: **duckplyr for single-table, dbplyr for joins.**
+:::
 
 ```{r query}
 con <- dbConnect(

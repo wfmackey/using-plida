@@ -7,32 +7,29 @@ subtitle: "A single-table workflow on individual tax returns"
 #| include: false
 source("R/00-paths.R")
 suppressPackageStartupMessages({
-  library(duckdb); library(DBI); library(dplyr); library(dbplyr)
+  library(duckplyr)
   library(ggplot2); library(scales); library(tictoc)
 })
-
-con <- dbConnect(
-  duckdb::duckdb(),
-  dbdir = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
-  read_only = TRUE
-)
 ```
 
 This case study works through a simple question: **what does the distribution of occupation groups look like in the individual tax returns?** It uses only the `itr` table — no joins, no spine files, just filtering and aggregating one big table. If you're picking up PLIDA for the first time, start here.
 
-## Connect to DuckDB
+## Read the data with duckplyr
 
-If you've run through the [setup steps](05-recommendations.qmd), you have a DuckDB database with the ITR data loaded. Open a read-only connection:
+duckplyr can read parquet files directly — no DBI connection, no database setup. Just point it at the files:
 
 ```{r connect}
-itr <- tbl(con, "itr")
+itr <- read_parquet_duckdb(
+  file.path(paths$parquet_root, "itr_context/*.parquet"),
+  prudence = "stingy"
+)
 ```
 
-`itr` is now a lazy dbplyr table. Nothing has been read into memory — you can work with it like a tibble, but the computation happens in DuckDB.
+`itr` is now a lazy duckplyr frame backed by DuckDB. Nothing has been read into memory. You work with it using normal dplyr verbs — but the computation happens in DuckDB.
 
 ::: {.callout-note}
-## Why `read_only = TRUE`?
-By default DuckDB locks the database file for exclusive access. If you open it read-write in your R console and then try to render a Quarto doc that also opens it, one of them will fail. Read-only connections can be shared across sessions.
+## What is `prudence = "stingy"`?
+By default, duckplyr will materialise results into R memory when you access them. Setting `prudence = "stingy"` prevents this — it keeps everything in DuckDB until you explicitly `collect()`. This is what you want for large data: it ensures you never accidentally pull 170 million rows into R.
 :::
 
 ```{r glimpse}
@@ -49,34 +46,25 @@ How many people file a tax return each year, broken down by ANZSCO major group (
 tic("Groupby on 170M rows")
 occ_by_year <- itr |>
   filter(!is.na(OCPTN_GRP_CD)) |>
-  mutate(occ_major = OCPTN_GRP_CD %/% 1000L) |>
-  group_by(INCM_YR, occ_major) |>
-  summarise(n = n(), .groups = "drop") |>
+  mutate(occ_major = as.integer(OCPTN_GRP_CD / 1000)) |>
+  summarise(n = n(), .by = c(INCM_YR, occ_major)) |>
   collect()
 toc()
 
 occ_by_year
 ```
 
-Everything up to `collect()` is lazy — the dplyr chain builds a SQL query that DuckDB executes. 170 million input rows collapse to a few hundred output rows. That is the pattern: push the heavy work to DuckDB, `collect()` only when the result fits in memory.
+Everything up to `collect()` is lazy — the dplyr chain builds a query that DuckDB executes. 170 million input rows collapse to a few hundred output rows. That is the pattern: push the heavy work to DuckDB, `collect()` only when the result fits in memory.
 
 ::: {.callout-tip}
-## The golden rule of dbplyr
+## The golden rule
 `collect()` only when the result is small. If you find yourself wanting to `collect()` and _then_ `filter()`, you have it backwards.
 :::
 
-Here is the SQL that dbplyr generated:
-
-```{r show-query}
-itr |>
-  filter(!is.na(OCPTN_GRP_CD)) |>
-  mutate(occ_major = OCPTN_GRP_CD %/% 1000L) |>
-  group_by(INCM_YR, occ_major) |>
-  summarise(n = n(), .groups = "drop") |>
-  show_query()
-```
-
-If you know SQL, this is useful for debugging. If you don't, the dplyr verbs are what matter — `show_query()` is there when you need it.
+::: {.callout-note}
+## Why `as.integer(x / 1000)` instead of `x %/% 1000`?
+duckplyr doesn't translate R's integer division operator `%/%`. The workaround is `as.integer(x / y)`, which duckplyr handles natively. If you're using dbplyr (which we use in the later case studies for joins), `%/%` works fine — it translates to DuckDB's `FDIV()`. This is one of the small translation gaps between duckplyr and dbplyr.
+:::
 
 ## Plot
 
@@ -110,29 +98,23 @@ You queried 170 million rows, grouped by two variables, and plotted the result �
 
 ::: {.callout-important}
 ## The comparison that matters
-The same groupby on 170M rows: **dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM. DuckDB via dbplyr takes 0.16 seconds and 0.25 GB.** See the full [benchmark results](04-benchmarks.qmd).
+The same groupby on 170M rows: **dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM. duckplyr takes under a second and uses negligible memory.** See the full [benchmark results](04-benchmarks.qmd).
 :::
 
 The workflow is always:
 
-1.  `tbl(con, "table_name")` to get a lazy handle.
+1.  `read_parquet_duckdb()` to get a lazy handle.
 2.  dplyr verbs to build the query.
 3.  `collect()` to pull the (small) result into R.
 4.  ggplot2 from there.
 
-## A note on `sql()`
+## duckplyr vs dbplyr: when to use which
 
-Occasionally dbplyr generates something that doesn't translate cleanly. When that happens, drop into raw SQL inside the pipe:
+This case study uses **duckplyr** — it reads parquet directly and runs dplyr verbs through DuckDB with no database setup. For single-table operations like this, duckplyr is the simplest tool.
 
-```r
-itr |>
-  mutate(occ_major = sql("OCPTN_GRP_CD / 1000")) |>
-  ...
-```
+For **joins across large tables** (case studies 2–4), we switch to **dbplyr with a DBI connection** to a materialised DuckDB database. The reason: duckplyr's in-memory DuckDB engine runs out of memory on joins involving 30M+ rows per side on a 32 GB machine. A direct DBI connection to a `.duckdb` file lets DuckDB operate on its native storage with efficient buffer-pool paging — a fundamentally different memory profile. See [case study 2](cs02-health-services.qmd) for that approach.
 
-Try the dplyr version first — it usually works. `sql()` is the fallback.
-
-```{r disconnect}
-#| include: false
-dbDisconnect(con, shutdown = TRUE)
-```
+::: {.callout-note}
+## The rule of thumb
+**duckplyr** for single-table work (filter, mutate, groupby, summarise) — no setup, reads parquet directly, handles 170M rows easily. **dbplyr + DBI** for multi-table joins and window functions at scale — needs a materialised DuckDB database but handles operations duckplyr can't.
+:::

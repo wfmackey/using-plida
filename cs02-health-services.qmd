@@ -22,6 +22,11 @@ This case study asks: **how does MBS service use vary by sex and age?** It's the
 
 The MBS 2015 claims file has 372 million rows. Loading it into memory is not an option on a 32 GB machine — we tested that in the [benchmarks](04-benchmarks.qmd), and even arrow's join engine was killed by the operating system. DuckDB handles the whole thing in a few seconds.
 
+::: {.callout-note}
+## Why dbplyr, not duckplyr?
+[Case study 1](cs01-earnings.qmd) used duckplyr to read parquet directly — no database needed. That works beautifully for single-table operations. For joins across large tables, duckplyr's in-memory DuckDB engine runs out of memory on a 32 GB machine (the hash tables for a 30M × 372M join exceed the ~18 GB it allocates). dbplyr with a DBI connection to a materialised `.duckdb` file lets DuckDB operate on its native storage with efficient buffer-pool paging. This is the right tool when tables get big.
+:::
+
 ## The PLIDA join model
 
 PLIDA data comes from different government agencies, and each agency has its own person identifier (`SYNTHETIC_AEUID`). The _spine tables_ link them: each spine maps `spine_id` (a universal key) to one agency's identifier.
