@@ -28,7 +28,24 @@ The size you generate depends on what you want to test. The case studies on this
 | 10M | ~250 GB | ~50 GB | Join and window function testing |
 | 30M | ~750 GB | ~130 GB | Full PLIDA-scale stress testing |
 
-fplida can write parquet directly (recommended) or CSV:
+The total disk size understates the challenge — it's the dataset-level row counts that matter. PLIDA datasets are not one-row-per-person; MBS has ~12 claims per person per year, STP has ~52 payroll records per employed person per year, and the ITR has multiple sub-tables per person per year. Even at 1 million people, joins across these tables involve tens of millions of rows:
+
+| Dataset | 100K people | 1M people | 30M people |
+|---------|------------|-----------|------------|
+| Census (person-level) | 100K | 1M | 30M |
+| ITR context (person × year × sub-table) | ~570K | ~5.7M | ~170M |
+| MBS claims (person × service × year) | ~1.2M | ~12M | ~372M |
+| STP payroll (person × employer × week) | ~11.6M | ~116M | ~3.5B |
+| Travellers (person × quarter) | ~370K | ~3.7M | ~110M |
+
+At 1 million people, joining MBS to demographics already involves 12 million claims — enough that naive in-memory approaches start to struggle and the tools on this site start to matter.
+
+::: {.callout-note}
+## Why CSV?
+fplida can output parquet directly, and parquet is faster to work with (as we show on the [CSV to parquet](02-csv-to-parquet.qmd) page). But most data in PLIDA is delivered as CSV. If you're learning these tools to prepare for working with real PLIDA data, generating CSV and converting it yourself is the more realistic exercise.
+:::
+
+fplida can write parquet directly or CSV:
 
 ```r
 library(fplida)
