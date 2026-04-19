@@ -1,0 +1,24 @@
+// ----------------------------------------------------------------------
+// Site-wide SCSS overrides for the cosmo Bootstrap theme.
+//
+// Two things happen here:
+//   1. Load the Inter typeface from Google Fonts so bold weight 600 renders
+//      consistently across systems (the system font stack rounds 600 to 700
+//      on machines without SF Pro / Segoe UI Variable).
+//   2. Lower the default bold weight from 700 to 600.
+// ----------------------------------------------------------------------
+
+/*-- scss:defaults --*/
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+// Bootstrap picks this up for body, headings, nav, buttons, etc.
+$font-family-sans-serif: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+// Used by Bootstrap utilities that set bold text; our rule below takes care
+// of the literal <strong>/<b> tags that Markdown emits for `**text**`.
+$font-weight-bold: 600;
+
+/*-- scss:rules --*/
+
+strong, b { font-weight: 600; }

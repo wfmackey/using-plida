@@ -101,6 +101,11 @@ dhda_sp_ar <- open_dataset(file.path(pq, "dhda-spine"))  |> rename_with(tolower)
 
 The two objects behave almost identically from dplyr's point of view.
 
+::: {.callout-note}
+## Storage layout still matters
+The dplyr syntax is the same regardless of how the parquet was written, but the file layout underneath is not an implementation detail. The focused layout benchmark on this machine (`itr_context`, 1.8 GB) found three things worth carrying into the rest of the walkthrough: explicit `zstd` cut the footprint materially, year partitioning helped year-filter queries, and tiny row groups were predictably bad. The short version is in [CSV to parquet](02-csv-to-parquet.qmd); the join-key side of the story is in [Storage layout](04b-storage-layout.qmd).
+:::
+
 ```{r glimpse-duckdb}
 glimpse(itr_db)
 ```

@@ -5,11 +5,12 @@ title: "Storage layout: sorting, keys, and why they matter"
 ```{r setup}
 #| include: false
 source("R/00-paths.R")
+source("R/helpers.R")
 suppressPackageStartupMessages({
   library(dplyr); library(arrow); library(fs); library(knitr); library(scales); library(ggplot2); library(tidyr)
 })
 log_path <- file.path(paths$bench_dir, "storage-variant-log.parquet")
-var_log  <- if (file_exists(log_path)) read_parquet(log_path) else tibble()
+var_log  <- if (file_exists(log_path)) latest_results(read_parquet(log_path), c("task", "approach")) else tibble()
 ```
 
 The previous page showed that DuckDB already crushes dplyr and arrow on a three-table PLIDA join. The obvious follow-up: **can we make DuckDB itself faster by arranging the data differently on disk?** The answer — after actually running the experiments — is "it depends on the query", and the results reward thinking carefully about how zonemap pruning actually works.
@@ -100,7 +101,7 @@ if (nrow(var_log) > 0 && any(var_log$task == "point")) {
 }
 ```
 
-Sorted is **~47× faster than baseline** and the int-key variant matches it. This is the win the DuckDB docs promise, and it is exactly what zonemap pruning is designed for: a single-value filter on a sorted column touches essentially one row group. Use this kind of layout for any fact table where you routinely ask "tell me everything about _this_ person".
+Sorted is **roughly 50× faster than baseline** and the int-key variant matches it. This is the win the DuckDB docs promise, and it is exactly what zonemap pruning is designed for: a single-value filter on a sorted column touches essentially one row group. Use this kind of layout for any fact table where you routinely ask "tell me everything about _this_ person".
 
 ## Task B — narrow-filter three-way join (birth year 1970)
 
@@ -171,7 +172,7 @@ if (nrow(var_log) > 0) {
 }
 ```
 
-The int-key variant is roughly **2× faster** than the string-key version of the same query — matching the docs' ~1.8× figure almost exactly. This is the clearest win of the page: hashing a string identifier to `UINT64` at ingest time costs almost nothing, adds a single column worth of storage, and pays off in every join downstream. You do not have to choose — keep the original string column for display, use the hash for joins.
+The int-key variant is roughly **1.9× faster** than the string-key version of the same query — matching the docs' ~1.8× figure almost exactly. This is a real win, but I would still treat it as an optimisation rather than the default schema for this project: a hashed surrogate key adds another column to carry through the workflow, and unlike an exact integer recode it is not formally collision-free. The safe interpretation is: **if repeated string-key joins dominate your workload, benchmark a numeric surrogate key.**
 
 ## What about the `PRIMARY KEY` variant?
 
@@ -184,7 +185,7 @@ The only observation worth noting is build cost: the PK fill took noticeably lon
 1.  **Sort the fact table by the column you do point lookups on.** That is where sorting wins, dramatically, and the win is reliable because zonemap pruning on a single-value filter is about as close to a free lunch as OLAP offers.
 2.  **Sorting does not help every query.** It only helps when the filter produces a contiguous range of the sorted column. Demographic filters that are uncorrelated with the join key get no benefit from sorting on that key.
 3.  **Sorting full-scan workloads is mildly harmful.** Do not sort tables that you only ever scan end-to-end.
-4.  **Use integer join keys.** Hash the string identifier once at ingest and join on the integer. This is the only optimisation on this page that helps _every_ kind of join, not just the filter-friendly ones.
+4.  **If repeated string-key joins dominate, benchmark a numeric surrogate key.** On this corpus the hashed-int variant was about 1.9× faster on the narrow join. That is strong enough to be worth exploring, but not strong enough to justify adding a collision-prone surrogate column to every table by default.
 5.  **Do not declare `PRIMARY KEY` or `UNIQUE` for performance.** Declare them for correctness. Expect slower ingest and no query benefit.
 
-The practical upshot for the PLIDA recipe in step 2 of the main pipeline: when building the DuckDB tables, sort the large fact tables by the join key, and materialise a `hash(SYNTHETIC_AEUID)` column alongside. Everything else in the main [recommendations](05-recommendations.qmd) still applies.
+The practical upshot for the PLIDA recipe in step 2 of the main pipeline is more selective than I expected when I started this page: **do not sort the big fact tables by join key by default.** Keep the baseline materialised table simple unless your workload is dominated by point lookups or filters that are tightly aligned with that key. If those are common, a sorted secondary copy is worth the one-off build cost. If repeated `SYNTHETIC_AEUID` joins dominate and the extra schema complexity is acceptable, a numeric surrogate key is the next thing to benchmark. Everything else in the main [recommendations](05-recommendations.qmd) still applies.

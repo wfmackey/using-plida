@@ -57,3 +57,24 @@ log_result <- function(row, file) {
   write_parquet(out, file)
   invisible(out)
 }
+
+# Keep only the most recent row per key combination in a benchmark log.
+# If a timestamp column is present, use it; otherwise, keep the last row
+# encountered for each key in file order.
+latest_results <- function(df, keys) {
+  if (nrow(df) == 0) return(df)
+
+  grouped <- df |>
+    group_by(across(all_of(keys)))
+
+  if ("timestamp" %in% names(df)) {
+    grouped |>
+      arrange(timestamp, .by_group = TRUE) |>
+      slice_tail(n = 1) |>
+      ungroup()
+  } else {
+    grouped |>
+      slice_tail(n = 1) |>
+      ungroup()
+  }
+}

@@ -5,11 +5,12 @@ title: "Benchmarks"
 ```{r setup}
 #| include: false
 source("R/00-paths.R")
+source("R/helpers.R")
 suppressPackageStartupMessages({
   library(dplyr); library(arrow); library(ggplot2); library(knitr); library(scales); library(fs)
 })
 log_path <- file.path(paths$bench_dir, "benchmark-log.parquet")
-bench <- if (file_exists(log_path)) read_parquet(log_path) else tibble()
+bench <- if (file_exists(log_path)) latest_results(read_parquet(log_path), c("task", "approach")) else tibble()
 
 approach_levels <- c("dplyr", "datatable", "arrow", "duckdb_view", "duckdb_table")
 task_labels <- c(
@@ -90,11 +91,12 @@ The DuckDB table version is meaningfully faster than the DuckDB view version bec
 
 Out-of-core regime, and the only task that actually discriminates between the backends. dplyr and data.table are _not run_: loading 18.7 GB of MBS parquet into a tibble on a 32 GB machine makes the machine unusable within seconds. That is not a benchmark failure — it is the reason this site exists.
 
-Arrow, DuckDB/view, and DuckDB/table all complete the task with bounded memory, but the shapes of the curves differ:
+In the fresh benchmark run, **Arrow did not complete the task at all**: the Acero join engine was killed by the OS on the 32 GB machine. That leaves two viable out-of-core options:
 
-- **Arrow** streams the join via the Acero engine. It is slower than DuckDB because the join implementation is younger and less tuned, but it holds memory essentially flat.
-- **DuckDB/view** lets DuckDB drive the parquet reader directly. Performance is dominated by parquet decode speed; memory stays under the `memory_limit` we set.
-- **DuckDB/table** is the fastest of the three, because it owns the storage. It is also the one you want to use in practice, once you have paid the one-off ingest cost from the previous page.
+- **DuckDB/view** lets DuckDB drive the parquet reader directly. It completed the join in `6.39s`.
+- **DuckDB/table** is the fastest of the two, because it owns the storage. It completed the same join in `3.71s`.
+
+That is the practical dividing line in this project: Arrow is fine for scans and smaller joins; once the workload looks like a real PLIDA fact-table join, DuckDB tables are the safe default.
 
 ## Peak memory
 

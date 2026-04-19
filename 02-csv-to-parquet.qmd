@@ -5,11 +5,16 @@ title: "CSV to parquet"
 ```{r setup}
 #| include: false
 source("R/00-paths.R")
+source("R/helpers.R")
 suppressPackageStartupMessages({
-  library(dplyr); library(arrow); library(fs); library(ggplot2); library(scales); library(knitr)
+  library(dplyr); library(arrow); library(fs); library(ggplot2); library(scales); library(knitr); library(tidyr)
 })
 log_path <- file.path(paths$bench_dir, "convert-log.parquet")
-convert_log <- if (file_exists(log_path)) read_parquet(log_path) else tibble()
+convert_log <- if (file_exists(log_path)) latest_results(read_parquet(log_path), c("label", "file")) else tibble()
+layout_log_path <- file.path(paths$bench_dir, "parquet-layout-log.parquet")
+layout_log <- if (file_exists(layout_log_path)) latest_results(read_parquet(layout_log_path), c("task", "variant", "engine")) else tibble()
+backend_log_path <- file.path(paths$bench_dir, "csv-backend-log.parquet")
+backend_log <- if (file_exists(backend_log_path)) latest_results(read_parquet(backend_log_path), c("approach", "label")) else tibble()
 ```
 
 ## Should CSV become parquet before use?
@@ -18,37 +23,102 @@ Yes — essentially always. The argument is boring and overwhelming:
 
 - **Schema.** CSV has no types. Every read has to either guess or be handed a schema. Parquet stores the schema with the file.
 - **Columnar I/O.** PLIDA-style tables have dozens to hundreds of columns but most queries touch a handful. Parquet lets the reader fetch only those columns; CSV forces a full row scan.
-- **Compression.** ZSTD-compressed parquet is typically half the size of the raw CSV. On this corpus we see the 44.5 GB MBS 2015 file shrink to 18.7 GB — and that version is simultaneously faster to read.
+- **Compression.** Parquet compression is strong, and explicit `zstd` is worth asking for. On this corpus the 44.5 GB MBS 2015 file shrank to 18.7 GB even before the layout pass below; on the focused `itr_context` rewrite, explicit `zstd` cut the footprint from 1.82 GB to 1.22 GB.
 - **Row groups and zonemaps.** Parquet stores per-row-group statistics. If you filter on `INCM_YR = 2014`, DuckDB/arrow can skip entire row groups whose min/max for `INCM_YR` does not overlap 2014.
 - **Interop.** Every engine we care about — arrow, duckdb, polars, pandas, pyarrow — reads parquet natively. CSV has a thousand dialects.
 
 The only reason _not_ to convert is if the file is too small to bother, and in that case the conversion is free anyway.
 
-## How we convert without running out of memory
+## Why Arrow was the obvious first choice
 
-A naive `readr::read_csv()` on the 44.5 GB MBS 2015 file is out of the question on 32 GB of RAM. The right idiom is to **stream** the file: open it as an arrow CSV dataset (which only parses in batches), and hand those batches straight to a parquet writer.
+Arrow was the first tool I reached for because it is the obvious R-native streaming answer: `open_csv_dataset()` reads in batches, `write_dataset()` writes parquet directly, and the whole thing stays comfortably below the machine's RAM limit. That is a perfectly sensible default, and it worked.
 
-```r
-library(arrow)
-library(fs)
+The question is whether it is the **best** default once DuckDB is already in the project anyway.
 
-ds <- open_csv_dataset("dhda-mbs/madipge-mbs-d-claims-2015.csv")
-write_dataset(
-  ds,
-  path = "/offline/using-plida-data/parquet/dhda-mbs",
-  format = "parquet",
-  basename_template = "mbs-2015-{i}.parquet",
-  max_rows_per_file = 5e6,
-  existing_data_behavior = "overwrite"
-)
+## Arrow vs DuckDB on large CSV → parquet runs
+
+To answer that, I benchmarked the current Arrow path against DuckDB's CSV reader plus `COPY ... TO parquet` on **six genuinely large source files** from this corpus:
+
+- three MBS yearly claim files (`48-51 GB` each)
+- three STP yearly payroll files (`48 GB` each)
+
+Both backends wrote zstd-compressed parquet with medium row groups and medium-sized output files. The DuckDB side used `ROW_GROUP_SIZE 250000` and `ROW_GROUPS_PER_FILE 20`; the Arrow side used `min_rows_per_group = max_rows_per_group = 250000L` and `max_rows_per_file = 5e6`.
+
+The benchmark lives in `R/10-benchmark-csv-backends.R` and logs to `benchmarks/csv-backend-log.parquet`.
+
+```{r backend-table}
+#| echo: false
+if (nrow(backend_log) > 0) {
+  backend_log |>
+    transmute(
+      label,
+      approach,
+      csv_gb = round(csv_gb, 1),
+      parquet_gb = round(parquet_gb, 2),
+      n_files,
+      seconds = round(seconds, 1),
+      rss_peak_gb = round(rss_peak_gb, 2)
+    ) |>
+    arrange(label, approach) |>
+    kable()
+}
 ```
 
-Four details in that snippet are worth spelling out:
+```{r backend-summary}
+#| echo: false
+if (nrow(backend_log) > 0) {
+  backend_log |>
+    group_by(approach) |>
+    summarise(
+      files = n(),
+      mean_seconds = round(mean(seconds), 1),
+      median_seconds = round(median(seconds), 1),
+      mean_parquet_gb = round(mean(parquet_gb), 2),
+      mean_rss_gb = round(mean(rss_peak_gb), 2),
+      .groups = "drop"
+    ) |>
+    kable()
+}
+```
 
-1.  **`open_csv_dataset`** is lazy. Nothing is read until the writer pulls from it. This is what keeps memory flat.
-2.  **`max_rows_per_file = 5e6`** caps the parquet file size so downstream tools (DuckDB, arrow) can parallelise the read and skip row groups. Without this you get one enormous parquet file.
-3.  **`existing_data_behavior = "overwrite"`** — note the bare `"overwrite"`, not `"overwrite_or_ignore"`. Earlier arrow versions used the longer name; current arrow accepts only `"overwrite"`, `"error"`, or `"delete_matching"`. Every conversion job silently failing for an 8 ms "arg should be one of..." error was my first bug of the day.
-4.  Arrow is **not doing column selection** here — it is writing every column. For subset-before-convert you would use `ds |> select(...) |> write_dataset(...)` — arrow will push the projection into the CSV scan.
+The result is not close:
+
+- **DuckDB was about 2x faster on average.** Across the six files, Arrow averaged `130.0s`; DuckDB averaged `67.3s`.
+- **DuckDB wrote slightly smaller parquet.** Mean output size was `8.57 GB` for Arrow and `8.21 GB` for DuckDB on the same source files.
+- **Both stayed within the machine budget.** Arrow's peak RSS averaged `2.41 GB`; DuckDB's averaged `2.73 GB`.
+
+That is strong enough to change the project default. For this corpus, on this machine, **DuckDB is the better CSV → parquet converter**.
+
+## How we convert without running out of memory
+
+A naive `readr::read_csv()` on a 45-50 GB source file is out of the question on 32 GB of RAM. The current project default is DuckDB's streaming CSV reader feeding its parquet writer directly:
+
+```r
+library(duckdb)
+library(DBI)
+
+con <- dbConnect(duckdb::duckdb())
+dbExecute(con, "SET threads TO 8")
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET preserve_insertion_order = false")
+
+dbExecute(con, "
+  COPY (
+    SELECT * FROM read_csv_auto('dhda-mbs/madipge-mbs-d-claims-2015.csv')
+  ) TO '/offline/using-plida-data/parquet/dhda-mbs'
+  (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)
+")
+```
+
+Five details in that snippet are worth spelling out:
+
+1.  **`read_csv_auto()`** is still a streaming bulk reader. DuckDB is not materialising the whole CSV in R memory first.
+2.  **`COMPRESSION zstd`** is worth setting explicitly here too.
+3.  **`ROW_GROUP_SIZE 250000`** lands in the same middle ground as the Arrow layout benchmark below: large enough to compress well, small enough to avoid a metadata explosion.
+4.  **`ROW_GROUPS_PER_FILE 20`** gives about five million rows per output file, which is the same basic target as the old Arrow pipeline's `max_rows_per_file = 5e6`.
+5.  **`preserve_insertion_order = false`** is a DuckDB performance setting worth flipping for bulk import/export work where output row order is irrelevant.
+
+If you only need a subset of columns, DuckDB can do that too: put the `SELECT col_a, col_b, ...` inside the `COPY (...) TO ...` query and the projection stays inside the engine.
 
 ## The numbers
 
@@ -59,6 +129,7 @@ if (nrow(convert_log) > 0) {
     filter(!is.na(seconds), !is.na(csv_gb)) |>
     transmute(
       label,
+      approach,
       file,
       csv_gb     = round(csv_gb, 2),
       parquet_gb = round(parquet_gb, 2),
@@ -74,7 +145,7 @@ if (nrow(convert_log) > 0) {
 }
 ```
 
-The headline row is the 44.5 GB MBS 2015 file converted to 18.7 GB of parquet in about 2 minutes with peak resident-set size under 2 GB. That is the whole point of streaming: the file is an order of magnitude larger than the memory budget, and the budget never flinches.
+The headline row is the 44.5 GB MBS 2015 file converted to 18.7 GB of parquet in about 2 minutes with peak resident-set size under 2 GB. That is the whole point of the out-of-core path, regardless of engine: the file is an order of magnitude larger than the memory budget, and the budget never flinches.
 
 ```{r convert-plot}
 #| echo: false
@@ -89,12 +160,58 @@ if (nrow(convert_log) > 0) {
     scale_x_continuous("CSV size (GB)", trans = "log10") +
     scale_y_continuous("Conversion time (s)", trans = "log10") +
     labs(title = "Conversion time scales linearly with CSV size",
-         subtitle = "arrow streaming; zstd parquet; 8 threads") +
+         subtitle = "out-of-core CSV -> parquet conversion") +
     theme_minimal(base_size = 11)
 }
 ```
 
-Across the 80-plus files we converted, wall time is essentially linear in CSV size at about 2-3 seconds per GB. Peak RSS stays near 2 GB regardless of input size. Parquet is roughly half the CSV size.
+Across the files we converted, wall time is essentially linear in CSV size and peak RSS stays modest. The backend comparison above is the more important number now: for the big files in this corpus, DuckDB is materially faster than Arrow at this one step.
+
+## Layout details are worth caring about
+
+The Arrow and DuckDB docs both make the same point: **Parquet is not one format, it is a family of layouts.** File size, compression, partitioning, and row-group size all matter. So I rewrote the 1.8 GB `itr_context` parquet in a few variants and reran one year-filter query plus one full groupby in both engines.
+
+```{r layout-table}
+#| echo: false
+if (nrow(layout_log) > 0) {
+  size_rows <- layout_log |>
+    filter(task %in% c("layout", "write")) |>
+    transmute(variant, size_gb) |>
+    distinct(variant, .keep_all = TRUE)
+
+  timing_rows <- layout_log |>
+    filter(task %in% c("year_filter", "full_groupby")) |>
+    transmute(variant, metric = paste(task, engine, sep = "_"), seconds) |>
+    pivot_wider(names_from = metric, values_from = seconds)
+
+  size_rows |>
+    left_join(timing_rows, by = "variant") |>
+    mutate(
+      variant = recode(
+        variant,
+        baseline_current = "current layout",
+        zstd_rg250k = "zstd + 250k row groups",
+        year_part_zstd_rg250k = "year partitions + zstd + 250k",
+        year_part_zstd_rg10k = "year partitions + zstd + 10k"
+      ),
+      across(where(is.double), ~ round(.x, 3))
+    ) |>
+    arrange(match(
+      variant,
+      c("current layout", "zstd + 250k row groups",
+        "year partitions + zstd + 250k", "year partitions + zstd + 10k")
+    )) |>
+    kable()
+}
+```
+
+Three takeaways matter for this project:
+
+- **Explicit zstd is worth it.** On `itr_context`, the current layout was 1.82 GB; the explicit `zstd + 250k` rewrite was 1.22 GB.
+- **Year partitioning helps year filters when the table is actually multi-year.** On the same table, DuckDB's `incm_yr == 2015` count fell from about `0.080s` on the current layout to `0.028s` on the year-partitioned layout; Arrow moved from `0.076s` to `0.066s`.
+- **Tiny row groups are bad.** The `10k`-row-group variant made the full groupby much slower: Arrow went from about `0.149s` to `0.515s`, DuckDB from `0.100s` to `0.235s`.
+
+The numbers are small because `itr_context` is only 1.8 GB, but the direction is the point. This is exactly what the docs predict. The practical rule: **use zstd, keep row groups medium-sized, and only partition on columns you actually filter on a lot.** For PLIDA that usually means year on multi-year panel-style tables; it does _not_ mean inventing partitions for a single-year fact table like MBS 2015.
 
 ## What about the CSV-to-DuckDB direct path?
 
@@ -104,4 +221,16 @@ DuckDB can ingest CSV directly with `read_csv_auto` or `COPY ... FROM 'x.csv'`, 
 2.  Ingesting CSV-to-DuckDB-table takes the same time as CSV-to-parquet plus parquet-to-DuckDB-table, and you end up with only the DuckDB copy.
 3.  If your DuckDB file ever corrupts or you want to reshard the database, you have to re-read the CSVs. With parquet in place, the DuckDB rebuild is cheap.
 
-The one exception is when you know you will only ever use DuckDB and the CSVs are small enough that a single-shot ingest is fine — then `COPY ... FROM ...` is slightly more convenient.
+The one exception is when you know you will only ever use DuckDB and the CSVs are small enough that a single-shot ingest is fine — then `CREATE TABLE AS SELECT * FROM read_csv_auto(...)` is slightly more convenient.
+
+::: {.callout-note}
+## Should we just use DuckDB for everything now?
+No. This benchmark says DuckDB is the better **CSV → parquet converter** on this machine. It does _not_ mean Arrow stops being useful.
+
+Arrow still matters in this project for two reasons:
+
+- it is a very convenient reader/query layer over parquet when spinning up a DuckDB database is overkill;
+- parquet remains an ecosystem format, and Arrow is the most natural way to stay inside that ecosystem from R.
+
+So the revised rule is narrower and more defensible: **use DuckDB to build the parquet, keep parquet as the canonical intermediate, and use DuckDB or Arrow downstream depending on the query.**
+:::

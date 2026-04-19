@@ -242,7 +242,7 @@ run_one <- function(task, backend) {
                   error = function(e) list(.error = conditionMessage(e)))
   t1 <- Sys.time()
   rss1 <- rss_gb()
-  err <- if (is.list(res) && !is.null(res$.error)) res$.error else NA_character_
+  err <- if (!is.data.frame(res) && is.list(res) && !is.null(res$.error)) res$.error else NA_character_
   n <- if (is.data.frame(res)) nrow(res) else NA_integer_
   tibble(
     task = task, approach = backend,

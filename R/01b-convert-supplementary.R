@@ -1,61 +1,95 @@
 # Supplementary conversions: the demographic table + id-linker spines.
 #
-# The original plan used _system/base-spine.csv (11 GB) as the universal
-# spine. That file disappeared between runs (fplida_30m_csv/_system was
-# regenerated). We pivot to a more realistic PLIDA-style join model:
-#
-#   demo        = abs-core/plidage-core-demog-cb-c21-2006-latest.csv
-#                 keyed by SPINE_ID — birth year, gender, etc.
-#   abs_spine   = abs-core/abs-spine.csv
-#                 maps SPINE_ID -> ABS SYNTHETIC_AEUID
-#   ato_spine   = ato-pit_itr/ato-spine.csv
-#                 maps SPINE_ID -> ATO SYNTHETIC_AEUID
-#   dhda_spine  = dhda-mbs/dhda-spine.csv
-#                 maps SPINE_ID -> DHDA SYNTHETIC_AEUID
-#
-# Realistic join chain for a "how much MBS spending does each person get in
-# their first income year after age 25" question:
-#
-#   demo [SPINE_ID]
-#     --- ato_spine [spine_id, SYNTHETIC_AEUID] --- itr [SYNTHETIC_AEUID]
-#     --- dhda_spine [spine_id, SYNTHETIC_AEUID] --- mbs [SYNTHETIC_AEUID]
+# These are smaller than the MBS / STP fact tables, but we keep the same
+# DuckDB CSV -> parquet path as the main converter so the workflow stays
+# consistent across the project.
 
 source("R/00-paths.R")
 source("R/helpers.R")
 
 suppressPackageStartupMessages({
-  library(arrow); library(fs); library(dplyr); library(glue)
+  library(duckdb)
+  library(DBI)
+  library(dplyr)
+  library(fs)
+  library(glue)
 })
 
 log_file <- file.path(paths$bench_dir, "convert-log.parquet")
 
 convert_one <- function(csv_path, out_dir, label, basename_prefix) {
-  dir_create(out_dir)
-  message(glue("  converting {path_file(csv_path)} ({round(path_size_gb(csv_path),2)} GB)"))
+  dir_create(out_dir, recurse = TRUE)
+  marker <- path(out_dir, glue("{basename_prefix}.done"))
+
+  if (file_exists(marker)) {
+    return(tibble(
+      task = "convert", approach = "duckdb-copy", label = label,
+      file = path_file(csv_path),
+      csv_gb = path_size_gb(csv_path),
+      parquet_gb = tryCatch(sum(as.numeric(dir_info(out_dir,
+                                                    glob = glue("{basename_prefix}-*.parquet"))$size)) / 1024^3,
+                            error = function(e) NA_real_),
+      seconds = NA_real_, rss_peak_gb = NA_real_,
+      skipped = TRUE, error = NA_character_,
+      timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    ))
+  }
+
+  message(glue("  converting {path_file(csv_path)} ({round(path_size_gb(csv_path), 2)} GB)"))
+
+  tmp_dir <- file.path(out_dir, glue("{basename_prefix}-tmp"))
+  if (dir_exists(tmp_dir)) dir_delete(tmp_dir)
+  dir_create(tmp_dir, recurse = TRUE)
+
+  con <- dbConnect(duckdb::duckdb())
+  on.exit(try(dbDisconnect(con, shutdown = TRUE), silent = TRUE), add = TRUE)
+  dbExecute(con, "SET threads TO 8")
+  dbExecute(con, "SET memory_limit = '20GB'")
+  dbExecute(con, "SET preserve_insertion_order = false")
+
+  sql <- paste0(
+    "COPY (SELECT * FROM read_csv_auto(",
+    dbQuoteString(con, csv_path),
+    ")) TO ",
+    dbQuoteString(con, tmp_dir),
+    " (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)"
+  )
+
   gc(full = TRUE, verbose = FALSE)
-  rss0 <- rss_gb(); t0 <- Sys.time()
-  res <- tryCatch({
-    ds <- open_csv_dataset(csv_path)
-    write_dataset(
-      ds, path = out_dir, format = "parquet",
-      basename_template = glue("{basename_prefix}-{{i}}.parquet"),
-      max_rows_per_file = 5e6,
-      existing_data_behavior = "overwrite"
-    )
-    NULL
+  rss0 <- rss_gb()
+  t0 <- Sys.time()
+  err <- tryCatch({
+    dbExecute(con, sql)
+
+    tmp_files <- dir_ls(tmp_dir, glob = "*.parquet", type = "file")
+    out_files <- file.path(out_dir, glue("{basename_prefix}-{seq_along(tmp_files) - 1}.parquet"))
+    file_move(tmp_files, out_files)
+    dir_delete(tmp_dir)
+    file_create(marker)
+    NA_character_
   }, error = function(e) conditionMessage(e))
-  t1 <- Sys.time(); rss1 <- rss_gb()
-  tibble(
-    task = "convert", approach = "arrow-stream", label = label,
+  t1 <- Sys.time()
+  rss1 <- rss_gb()
+
+  row <- tibble(
+    task = "convert", approach = "duckdb-copy", label = label,
     file = path_file(csv_path),
     csv_gb = path_size_gb(csv_path),
-    parquet_gb = tryCatch(sum(as.numeric(dir_info(out_dir, glob = glue("*{basename_prefix}*.parquet"))$size))/1024^3,
+    parquet_gb = tryCatch(sum(as.numeric(dir_info(out_dir,
+                                                   glob = glue("{basename_prefix}-*.parquet"))$size)) / 1024^3,
                           error = function(e) NA_real_),
     seconds = as.numeric(difftime(t1, t0, units = "secs")),
     rss_peak_gb = max(rss0, rss1, na.rm = TRUE),
     skipped = FALSE,
-    error = if (is.null(res)) NA_character_ else res
+    error = err,
+    timestamp = format(t1, "%Y-%m-%d %H:%M:%S")
   )
+
+  dbDisconnect(con, shutdown = TRUE)
+  on.exit(NULL, add = FALSE)
+  if (dir_exists(tmp_dir)) dir_delete(tmp_dir)
+
+  row
 }
 
 jobs <- list(
@@ -75,4 +109,5 @@ for (j in jobs) {
   log_result(res, log_file)
   gc(full = TRUE, verbose = FALSE)
 }
+
 message("done.")

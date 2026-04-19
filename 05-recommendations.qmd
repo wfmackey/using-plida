@@ -6,25 +6,28 @@ title: "Recommendations"
 
 On larger-than-memory PLIDA data, on a laptop or workstation with modest RAM:
 
-1.  **Stream CSV → parquet with arrow** (`open_csv_dataset` + `write_dataset`). One pass, bounded memory, zstd-compressed output roughly half the size of the CSV. Partition the output per input year file to keep row groups small.
-2.  **Load parquet into a DuckDB database** as materialised tables. Use `SET memory_limit='20GB'` (or whatever leaves the OS and other processes room to breathe) and `SET threads TO 8`. This is a one-off cost.
-3.  **Query everything through `dbplyr`** connected to the DuckDB file. Use `tbl(con, "name")`, compose dplyr verbs, and only `collect()` when the result is small enough for R memory. Drop into raw SQL via `sql(...)` inside `mutate()` / `filter()` when the dplyr translation is missing or awkward.
+1.  **Convert CSV → parquet with DuckDB** (`read_csv_auto` + `COPY ... TO parquet`). On the local six-file large-file benchmark, DuckDB was about 2x faster than Arrow for this step while writing slightly smaller parquet. Keep zstd compression, medium row groups (`ROW_GROUP_SIZE 250000`), and medium-sized files (`ROW_GROUPS_PER_FILE 20` landed well here).
+2.  **Partition only where the filter pattern justifies it.** On the local layout benchmark, partitioning `itr_context` by `INCM_YR` improved year-filter queries, but the gain was small in absolute terms on local NVMe and irrelevant for one-year tables like MBS 2015. Partition multi-year tables on columns you really do filter on all the time; do not over-partition everything out of habit.
+3.  **Load parquet into a DuckDB database** as materialised tables once the workload becomes join-heavy, window-heavy, or repetitive. Use `SET memory_limit='20GB'` (or whatever leaves the OS and other processes room to breathe) and `SET threads TO 8`. For one-off scans and light exploration, views over parquet are fine.
+4.  **Query through `dbplyr` by default.** Use `tbl(con, "name")`, compose dplyr verbs, and only `collect()` when the result is small enough for R memory. Drop into raw SQL via `sql(...)` inside `mutate()` / `filter()` or use `dbGetQuery()` when the dplyr translation is missing or awkward.
 
 That's it. Everything else on this site is evidence that this recipe works.
 
 ## When to deviate
 
 - **Tiny data (sub-GB, single file).** Just use `read_csv` or `read_parquet` and dplyr-on-tibbles. A DuckDB connection is overkill.
-- **Ad-hoc exploration of a parquet directory you don't own.** `arrow::open_dataset() |> filter() |> collect()` is faster to type than wiring up a DuckDB view. If the query runs in under a couple of seconds, arrow wins on ergonomics.
+- **Ad-hoc exploration of a parquet directory you don't own.** `arrow::open_dataset() |> filter() |> collect()` is faster to type than wiring up a DuckDB view. If the query runs in under a couple of seconds, arrow still wins on ergonomics.
+- **You mostly do single-table scans and the parquet is already laid out well.** DuckDB views over parquet are already very fast on this machine for T1/T2-style work. Materialised tables start paying off when the workload becomes join-heavy or you keep rerunning the same queries.
 - **Heavy in-R post-processing on a small result.** Pull the result into memory with `collect()` and then use `data.table` if you need serious speed on the already-in-memory object — for example, writing a giant loop over group-level regressions. data.table is the right tool for fast in-memory manipulation; it is the wrong tool for reading a 45 GB CSV.
 - **You want to share the intermediate with a non-R user.** Use views over parquet and distribute the parquet. Other tools (polars, pandas, duckdb-cli) read it natively.
 
 ## Anti-patterns to avoid
 
-- **`read_csv()` on a file larger than RAM.** Don't. If you see `read_csv` near a PLIDA path, reach for arrow streaming instead.
+- **`read_csv()` on a file larger than RAM.** Don't. If you see `read_csv` near a PLIDA path, reach for DuckDB's CSV reader or Arrow's streaming path instead.
 - **Calling `collect()` early.** Once you pull a lazy query into R memory, every downstream verb runs in R and you lose DuckDB's pushdown advantage. Keep the pipe lazy until the _last_ step, and make sure the last step is small.
 - **`setDT(as.data.frame(arrow_table))` on big arrow objects.** Same problem as `read_csv` — it materialises the whole thing. If you find yourself writing this, the fix is almost always to push the filter/select/aggregation upstream into arrow or DuckDB first.
 - **Leaving DuckDB `memory_limit` at default.** On a 32 GB machine a default DuckDB connection will happily try to use most of free RAM for a large aggregation, collide with R's own heap, and get killed. Set the limit explicitly, somewhere around 60-70 % of physical memory.
+- **Tiny parquet row groups.** The local layout benchmark on `itr_context` made this painfully obvious: `10k`-row groups slowed the full groupby materially in both Arrow and DuckDB. Keep them in the documented middle ground.
 - **One enormous parquet file for a whole year of MBS claims.** DuckDB and arrow both want many medium-sized parquet files so they can parallelise reads and skip row groups. `max_rows_per_file = 5e6` is a reasonable default.
 
 ## How to think about it
@@ -33,10 +36,21 @@ The underlying principle is simple: **move the computation to the data, not the 
 
 Once you internalise that, the deviations in the previous section follow naturally. dplyr is not bad; it is optimised for a different regime. PLIDA data does not live in that regime.
 
+DuckDB winning the CSV → parquet benchmark does **not** imply "DuckDB for absolutely everything". It implies something narrower and more useful: DuckDB is the best bulk converter on this machine, parquet remains the canonical intermediate, and Arrow is still a useful parquet-native query layer when the job is simple enough that you do not want to materialise a DuckDB database first.
+
+## Bigger RAM, slower storage
+
+The 32 GB MacBook with local SSD is not the only machine worth thinking about.
+
+- **64 GB or 128 GB RAM with fast local SSD/NVMe.** The extra RAM mostly buys headroom for larger joins, sorts, and windows before DuckDB needs to spill. It does _not_ change the basic ranking: Parquet stays the interchange format, DuckDB tables stay the default for repeated heavy work, and Arrow stays a good low-overhead option for linear scan/filter/summarise pipelines.
+- **64 GB or 128 GB RAM with slow network storage.** More RAM does not fix network latency or low remote I/O. The DuckDB docs are quite direct here: network-attached storage is acceptable for read-only workloads, but not recommended for read-write DuckDB databases. The practical implication is to keep the canonical parquet wherever it lives, but put the working `.duckdb` file and DuckDB spill directory on local SSD whenever possible. If you cannot, expect views-over-parquet to become much less attractive because every repeated scan pays the network cost again.
+
+That second point is an inference from the docs plus the shape of these benchmarks: once I/O becomes the bottleneck, local materialisation matters more, not less.
+
 ## Reproducing everything on this site
 
 ```bash
-# 1. convert CSVs to parquet (arrow streaming, ~10 min for our subset)
+# 1. convert CSVs to parquet
 Rscript R/01-convert-csv-to-parquet.R
 Rscript R/01b-convert-supplementary.R
 

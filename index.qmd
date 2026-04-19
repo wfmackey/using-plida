@@ -21,7 +21,7 @@ The site answers four practical questions:
 
 ## The short answer
 
-If you read only the recommendations page: convert CSV to parquet with arrow streaming, load the parquet into a DuckDB database, and do everything else with `dbplyr` over that DuckDB connection. Fall back to `arrow::open_dataset` for ad-hoc exploration where spinning up a database is overkill, and reach for `data.table` only after you have filtered down to something that fits comfortably in memory.
+If you read only the recommendations page: convert CSV to parquet with DuckDB, not Arrow — the local six-file benchmark put DuckDB at about 2x faster for that step, with slightly smaller output. Keep the parquet layout disciplined (`zstd`, medium row groups, medium-sized files), then load the parquet into a DuckDB database for the join-heavy and repeated work, and do everything else with `dbplyr` over that DuckDB connection. Fall back to `arrow::open_dataset` or DuckDB views over parquet for ad-hoc exploration where spinning up a database is overkill, and reach for `data.table` only after you have filtered down to something that fits comfortably in memory.
 
 The rest of the site shows how we got there, with timings and memory footprints from real (synthetic) runs.
 

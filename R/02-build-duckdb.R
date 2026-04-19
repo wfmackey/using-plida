@@ -70,7 +70,8 @@ log_result(tibble(
   seconds = as.numeric(difftime(t1, t0, units = "secs")),
   rss_peak_gb = max(rss0, rss1, na.rm = TRUE),
   db_size_gb = path_size_gb(views_db),
-  n_rows = NA_integer_
+  n_rows = NA_integer_,
+  timestamp = format(t1, "%Y-%m-%d %H:%M:%S")
 ), log_file)
 
 dbDisconnect(con, shutdown = TRUE)
@@ -98,7 +99,8 @@ for (nm in names(parquet_sources)) {
     seconds = as.numeric(difftime(t1, t0, units = "secs")),
     rss_peak_gb = max(rss0, rss1, na.rm = TRUE),
     db_size_gb = path_size_gb(tables_db),
-    n_rows = n
+    n_rows = n,
+    timestamp = format(t1, "%Y-%m-%d %H:%M:%S")
   )
   print(row)
   log_result(row, log_file)

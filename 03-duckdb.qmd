@@ -5,11 +5,12 @@ title: "DuckDB: views vs materialised tables"
 ```{r setup}
 #| include: false
 source("R/00-paths.R")
+source("R/helpers.R")
 suppressPackageStartupMessages({
   library(dplyr); library(arrow); library(fs); library(knitr); library(scales)
 })
 log_path <- file.path(paths$bench_dir, "duckdb-build-log.parquet")
-build_log <- if (file_exists(log_path)) read_parquet(log_path) else tibble()
+build_log <- if (file_exists(log_path)) latest_results(read_parquet(log_path), c("task", "approach", "label")) else tibble()
 ```
 
 ## Two ways to wire DuckDB to parquet
@@ -99,6 +100,11 @@ A few points of good practice here:
 
 ## When to prefer views, when to prefer tables
 
-Rule of thumb: **prefer tables if you will run the same query more than two or three times**, and if the ingest cost is a one-off. Prefer views if the underlying parquet is changing, if disk space is precious (tables double the footprint in exchange for speed), or if you want other non-DuckDB tools to consume the same files.
+The fresh benchmarks on this machine make the trade-off a little more specific than the generic rule:
+
+- On **single-table scans and groupbys**, views over parquet are already excellent. In the current benchmark run the view was slightly faster than the materialised table on T1 and T2, and the difference was tiny in absolute terms.
+- On **join-heavy work**, tables pull away. On the 3-table MBS join (T3), the materialised table ran in `3.71s`; the view-over-parquet version took `6.39s`.
+
+So the practical rule is: **use views for ad-hoc exploration and one-off scans; use tables once the workload becomes join-heavy, window-heavy, or repetitive enough that the parquet decode cost keeps coming back.** Prefer views if the underlying parquet is changing, if disk space is precious (tables duplicate the storage in exchange for speed), or if you want other non-DuckDB tools to consume the same files unchanged.
 
 For a personal research project where parquet is the canonical source and DuckDB is just the query engine, I use tables for anything I am going to run many times (the main analysis tables) and views for supplementary stuff I touch once.
