@@ -16,6 +16,8 @@ website:
         text: CSV to Parquet
       - href: 03-duckdb.qmd
         text: DuckDB
+      - href: 03b-walkthrough.qmd
+        text: Walkthrough
       - href: 04-benchmarks.qmd
         text: Benchmarks
       - href: 04b-storage-layout.qmd

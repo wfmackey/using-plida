@@ -21,6 +21,7 @@ Reference pages:
 - `01-the-data.qmd` — fplida corpus, subset used, join model
 - `02-csv-to-parquet.qmd` — streaming conversion with arrow
 - `03-duckdb.qmd` — views vs materialised tables, dbplyr usage
+- `03b-walkthrough.qmd` — arrow vs DuckDB side-by-side dplyr tour: reading, verbs, all join types, window functions, timings, code tabs on every operation
 - `04-benchmarks.qmd` — 5 backends × 3 tasks
 - `04b-storage-layout.qmd` — sorting, integer keys, PRIMARY KEY experiments
 - `04c-window-strategies.qmd` — LAG vs self-join vs chunked approaches
