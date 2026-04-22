@@ -72,7 +72,7 @@ This shape of question appears so often in PLIDA work that most of the case stud
 
 ## Step 1 — CSV to parquet, using DuckDB
 
-CSV should essentially always become parquet before serious work begins. Four plain reasons:
+CSV should essentially always become parquet before serious work begins. Four main reasons:
 
 - **Parquet knows the column types; CSV doesn't.** In a CSV, every column is a string until something reads it and guesses. `year_of_birth` might be read as a number in one session and a character in the next. Parquet files record the type of each column once, at write time, and every tool that reads them agrees.
 - **Parquet lets you read one column at a time.** PLIDA tables have dozens of columns and most queries touch a handful. A CSV read always reads every column of every row. Parquet is arranged so that the reader can fetch only the columns the query actually uses. This is the single biggest reason these pipelines are fast.
@@ -96,7 +96,7 @@ dbExecute(con, "SET preserve_insertion_order = false")
 dbExecute(con, "
   COPY (
     SELECT * FROM read_csv_auto('dhda-mbs/madipge-mbs-d-claims-2015.csv')
-  ) TO '/offline/using-plida-data/parquet/dhda-mbs'
+  ) TO 'data/parquet/dhda-mbs'
   (FORMAT PARQUET, COMPRESSION zstd,
    ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)
 ")

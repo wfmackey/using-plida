@@ -4,9 +4,12 @@ author: "Will Mackey"
 ---
 
 ::: {.callout-warning}
-## Draft
-This site is a work in progress. The code, benchmarks, and recommendations are still being tested and may change. Don't rely on anything here yet.
+## Draft and written with AI
+This site is a work in progress. The code, benchmarks, and recommendations are still being tested and may change. The structure and testing guidance were human written, but in this current version the words and code have mostly been written by AI (as you may notice!). 
+
+Provided for guidance only. Don't _rely_ on anything here yet.
 :::
+
 
 ## What this site is
 
