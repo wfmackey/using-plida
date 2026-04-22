@@ -1,0 +1,136 @@
+---
+title: "A2 · Data manipulation benchmarks"
+subtitle: "Filter + count (T1) and groupby (T2) across five backends"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(ggplot2); library(knitr); library(scales); library(fs)
+})
+log_path <- file.path(paths$bench_dir, "benchmark-log.parquet")
+bench <- if (file_exists(log_path)) latest_results(read_parquet(log_path), c("task", "approach")) else tibble()
+
+approach_levels <- c("dplyr", "datatable", "arrow", "duckdb_view", "duckdb_table")
+task_labels <- c(
+  t1 = "T1: filter + count on 1 year of ITR",
+  t2 = "T2: groupby count on all years of ITR"
+)
+
+bench_t12 <- bench |> filter(task %in% c("t1", "t2"))
+```
+
+This appendix backs up the claims in [Data manipulation](02-data-manipulation.qmd). Two tasks, each run against five backends — **dplyr on in-memory tibbles, data.table, arrow datasets, DuckDB views over parquet, DuckDB materialised tables** — with each backend in a fresh R subprocess (`R/04-run-benchmarks.R`) so that memory from a prior run cannot pollute the next measurement.
+
+## The tasks
+
+- **T1 filter + count.** One year of ITR (~8 M rows), count rows with non-null occupation code. The easy one; included to get a baseline for "small file, nothing complicated".
+- **T2 groupby count.** All ~10 years of ITR pooled (~170 M rows), count rows per occupation group. Full scan of the biggest column-narrow table, exercise the groupby operator.
+
+The three-way MBS join (T3) is in [A3](A3-join-benchmarks.qmd).
+
+## Results
+
+```{r bench-table}
+#| echo: false
+if (nrow(bench_t12) > 0) {
+  bench_t12 |>
+    mutate(approach = factor(approach, levels = approach_levels)) |>
+    arrange(task, approach) |>
+    transmute(
+      task,
+      approach,
+      seconds = round(seconds, 2),
+      peak_rss_gb = round(rss_after_gb, 2),
+      rss_delta_gb = round(rss_delta_gb, 2),
+      n_result,
+      error = if_else(is.na(error), "", substr(error, 1, 60))
+    ) |>
+    kable()
+} else {
+  cat("(no benchmarks yet — run `Rscript R/04-run-benchmarks.R`)")
+}
+```
+
+```{r bench-plot}
+#| echo: false
+#| fig-width: 8
+#| fig-height: 5
+if (nrow(bench_t12) > 0) {
+  bench_t12 |>
+    filter(is.na(error)) |>
+    mutate(approach = factor(approach, levels = approach_levels),
+           task = factor(task, levels = names(task_labels), labels = task_labels)) |>
+    ggplot(aes(approach, seconds, fill = approach)) +
+    geom_col() +
+    facet_wrap(~ task, scales = "free_y", ncol = 1) +
+    scale_y_continuous("Seconds") +
+    labs(x = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 20, hjust = 1))
+}
+```
+
+### T1: filter + count on one year of ITR
+
+Small-file regime. Every backend can handle this, and the raw speed difference is mostly down to fixed costs — starting a DuckDB connection and opening a parquet file is a similar order of magnitude to the actual work. The key story here is _memory_ rather than time: dplyr and data.table both materialise the whole year's worth of ITR (~250 MB in memory), while arrow and duckdb hold almost nothing. They stream.
+
+This is the regime where the choice of backend genuinely does not matter for performance, and you might as well reach for the most ergonomic API (dbplyr, in my view).
+
+### T2: groupby count on all ITR years
+
+Medium regime. Now we are scanning ~170 M rows, about 2–3 GB of parquet. dplyr-on-tibbles is paying the full materialisation cost — it has to load every row into R memory before grouping. data.table is the same story (arrow → data.table conversion is a full copy). Arrow and DuckDB both stream the scan and only materialise the ~1000-row result.
+
+The DuckDB table version is meaningfully faster than the DuckDB view version because DuckDB's own storage is denser and the groupby runs against column stripes directly, without going through the parquet decoder on every query.
+
+## Peak memory
+
+```{r rss-plot}
+#| echo: false
+#| fig-width: 8
+#| fig-height: 4
+if (nrow(bench_t12) > 0) {
+  bench_t12 |>
+    filter(is.na(error)) |>
+    mutate(approach = factor(approach, levels = approach_levels),
+           task = factor(task, levels = names(task_labels), labels = task_labels)) |>
+    ggplot(aes(approach, rss_after_gb, fill = approach)) +
+    geom_col() +
+    facet_wrap(~ task, ncol = 2) +
+    scale_y_continuous("Peak RSS after task (GB)") +
+    labs(x = NULL, title = "Memory footprint after each task") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 20, hjust = 1))
+}
+```
+
+The memory plot is arguably the more important one. For the smallest task, every backend is fine. For the medium task, dplyr and data.table are already paying several GB for something that DuckDB handles in a few hundred MB.
+
+## Walkthrough timings
+
+A separate experiment walked through the same dplyr pipeline across DuckDB and Arrow, verb by verb, collecting per-chunk wall-clock times. The results reinforce the T1/T2 story and add a useful set of intermediate operations.
+
+| Operation (on a big table) | DuckDB | Arrow |
+|---|---|---|
+| filter + count on one year (~10M) | sub-second | sub-second |
+| groupby on all years (~170M) | ~1s | ~1s |
+| mutate + arrange on 30M demographic rows | ~1s | ~1s |
+
+The short version: **for scans, filters, mutates, and groupbys, DuckDB and Arrow are indistinguishable** on this corpus. The differences only open up once joins and windows enter the picture — covered in [A3](A3-join-benchmarks.qmd) and [A4](A4-window-function-benchmarks.qmd).
+
+Two further findings from the walkthrough that belong here:
+
+- **`as.integer()` does not mean the same thing in Arrow and DuckDB.** Arrow truncates; DuckDB rounds half-to-even. Using `as.integer(year_of_birth / 10) * 10` silently produces different decade counts. `floor(x / 10) * 10` works consistently across both. The discussion is in [Data manipulation § The `as.integer()` trap](02-data-manipulation.qmd#the-as-integer-trap-truncate-vs-round).
+- **`%/%` and `%%` are unreliable through Arrow's translator.** Use `floor(x / y)` and explicit modulus expressions for portability.
+
+## Reproducing
+
+```bash
+Rscript R/04-run-benchmarks.R
+```
+
+Writes `benchmarks/benchmark-log.parquet`, which this page consumes.

@@ -1,0 +1,300 @@
+---
+title: "Window functions"
+subtitle: "lag(), row_number(), rolling windows, and the billion-row pattern"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(duckdb); library(DBI); library(dbplyr)
+  library(dplyr)
+  library(ggplot2); library(scales); library(tictoc); library(knitr)
+})
+
+timings <- tibble()
+knitr::knit_hooks$set(time_it = function(before, options, envir) {
+  if (before) {
+    gc(full = TRUE, verbose = FALSE)
+    assign(".time_it_t0", Sys.time(), envir = envir)
+  } else {
+    secs <- as.numeric(difftime(Sys.time(), get(".time_it_t0", envir = envir), units = "secs"))
+    task <- options$time_it
+    approach <- if (!is.null(options$approach)) options$approach else "duckdb"
+    timings <<- bind_rows(timings, tibble(task = task, approach = approach, seconds = secs))
+    sprintf("\n::: {.callout-note appearance='minimal' collapse='false'}\n⏱️ **%s**: **%.3fs**\n:::\n", task, secs)
+  }
+})
+
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir     = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
+  read_only = TRUE
+)
+invisible(dbExecute(con, "SET threads TO 8"))
+invisible(dbExecute(con, "SET memory_limit = '20GB'"))
+
+itr_db    <- tbl(con, "itr")        |> rename_with(tolower)
+demo_db   <- tbl(con, "demo")       |> rename_with(tolower)
+ato_sp_db <- tbl(con, "ato_spine")  |> rename_with(tolower)
+```
+
+Window functions are the bread and butter of panel-data work. "Did this person change employer?" is `lag()`. "What is their rolling average income?" is a trailing `mean()` over a window. "When did their health service use spike?" is a comparison to a trailing average.
+
+On small data you write the window and move on. On PLIDA-scale data — hundreds of millions of rows per year of STP — you hit hard memory limits that force a different approach. This chapter covers both: the everyday dbplyr syntax for window functions, and the chunk-by-person-hash pattern that lets you run a `lag()` over a billion rows on a laptop.
+
+The evidence for the scaling behaviour is in [Appendix A4](A4-window-function-benchmarks.qmd).
+
+## Everyday windows: `window_order()` and `window_frame()`
+
+We will work against a small derived person-year panel — one row per person per income year with their occupation — built from the demographics, the ATO spine, and the ITR:
+
+```{r derive-panel}
+#| message: false
+tic("Materialise person-year panel (temp table)")
+wk_panel <- demo_db |>
+  filter(year_of_birth >= 1975L, year_of_birth <= 1984L) |>
+  select(spine_id, year_of_birth, core_gender) |>
+  inner_join(ato_sp_db, by = "spine_id") |>
+  inner_join(
+    itr_db |>
+      select(synthetic_aeuid, incm_yr, ocptn_grp_cd) |>
+      filter(!is.na(ocptn_grp_cd)),
+    by = "synthetic_aeuid"
+  ) |>
+  mutate(occ_major = as.integer(floor(ocptn_grp_cd / 1000))) |>
+  select(spine_id, incm_yr, occ_major, year_of_birth, core_gender) |>
+  compute(name = "wk_panel", temporary = TRUE, overwrite = TRUE)
+toc()
+
+cat("Panel rows:", format(wk_panel |> summarise(n = n()) |> pull(n), big.mark = ","), "\n")
+```
+
+`compute()` materialises the lazy pipeline into a temporary DuckDB table and hands back a `tbl()` pointing at it. No data has left DuckDB. We do this here because the next three window queries all reuse the same panel — without `compute()`, dbplyr would re-run the joins every time.
+
+Two idioms you need for dbplyr window functions:
+
+- **`group_by()` sets the `PARTITION BY`.** Same mental model as tibble-level grouping.
+- **`window_order()` sets the `ORDER BY`** of the window. This is easy to miss. `arrange()` alone is _not_ enough, because `arrange()` sorts the final output, not the window partition.
+
+### `row_number()`: first observation per person
+
+```{r rn-duckdb}
+#| time_it: "row_number() per person"
+first_returns <- wk_panel |>
+  group_by(spine_id) |>
+  window_order(incm_yr) |>
+  mutate(return_num = row_number()) |>
+  ungroup() |>
+  filter(return_num == 1L) |>
+  count(incm_yr, occ_major) |>
+  collect()
+head(first_returns)
+```
+
+`row_number()`, `rank()`, `dense_rank()` all work the same way. Useful patterns:
+
+- **First / last observation per person**: `row_number() == 1L` after `window_order()`.
+- **Deduplicate keeping latest**: same, but `window_order(desc(date))`.
+- **Chronological index**: expose `row_number()` as a column for later joins.
+
+### `lag()` for year-over-year change
+
+Did someone change ANZSCO major group from one return to the next?
+
+```{r lag-duckdb}
+#| time_it: "lag() per person"
+switches <- wk_panel |>
+  group_by(spine_id) |>
+  window_order(incm_yr) |>
+  mutate(prev_occ = lag(occ_major)) |>
+  ungroup() |>
+  filter(!is.na(prev_occ), prev_occ != occ_major) |>
+  count(incm_yr, prev_occ, occ_major) |>
+  collect()
+head(switches)
+```
+
+```{r plot-switches}
+#| fig-width: 8
+#| fig-height: 4.5
+switches |>
+  filter(prev_occ %in% 1:8, occ_major %in% 1:8) |>
+  group_by(incm_yr) |>
+  summarise(transitions = sum(n), .groups = "drop") |>
+  ggplot(aes(incm_yr, transitions)) +
+  geom_col(fill = "#2c7fb8") +
+  scale_y_continuous(labels = label_comma()) +
+  scale_x_continuous(breaks = seq(2010, 2022, 2)) +
+  labs(x = "Income year", y = "Occupation-group transitions",
+       title = "Year-over-year ANZSCO major-group transitions",
+       subtitle = "Derived with a lag() window on the person-year panel") +
+  theme_minimal(base_size = 11)
+```
+
+`lead()` works the same way, looking forward. Pair it with `lag()` when you need "what came before _and_ after this observation".
+
+### Rolling averages: `window_frame()`
+
+Frame clauses — "the previous three rows in time order, within this person" — are expressed in dbplyr with `window_frame(from, to)`. It translates to SQL's `ROWS BETWEEN from PRECEDING AND to FOLLOWING` (negative numbers are PRECEDING, zero is CURRENT ROW, positive is FOLLOWING).
+
+Example: the trailing-3-year average of `occ_major` for each person. Not an especially meaningful quantity for a categorical variable, but it demonstrates the mechanic.
+
+```{r rolling-duckdb}
+#| time_it: "rolling mean (window_frame)"
+rolling <- wk_panel |>
+  group_by(spine_id) |>
+  window_order(incm_yr) |>
+  window_frame(-3, -1) |>
+  mutate(trailing_mean_occ = mean(occ_major, na.rm = TRUE)) |>
+  ungroup() |>
+  filter(!is.na(trailing_mean_occ)) |>
+  head(6) |>
+  collect()
+rolling
+```
+
+The same idiom works for any window-appropriate aggregate: `sum()`, `mean()`, `median()`, `min()`, `max()`. It also works for `quantile_cont(x, p)`. See `show_query()` on the pipe to check the `OVER (... ROWS BETWEEN ...)` clause dbplyr generated.
+
+::: {.callout-important}
+## The window-function rule of thumb
+- **Simple partitioned windows** — `row_number()`, `rank()`, `lag()`, `lead()` — `group_by()` + `window_order()` + `mutate()`.
+- **Frame-based windows** — `ROWS BETWEEN N PRECEDING AND M PRECEDING/FOLLOWING` — add `window_frame(N, M)` to the pipe.
+- **Arrow is rarely the right tool** for anything beyond a trivial `row_number()` inside `arrange()`. Use DuckDB.
+:::
+
+## The scaling problem: when the obvious `lag()` cannot run
+
+Everything above ran happily on a panel of a few tens of millions of rows. Try the same `lag()` over the full STP payroll table — 697 million rows for one financial year, 3.5 billion across all five — and it will not complete on a 32 GB machine. The evidence is in [A4 §Scaling behaviour](A4-window-function-benchmarks.qmd#scaling-behaviour):
+
+| Rows per window operation | Status on 32 GB machine (24 GB to DuckDB) |
+|---------------------------|-------------------------------------------|
+| ~70M                      | Comfortable — `lag()` in ~2s             |
+| ~200M                     | Untested, likely works                   |
+| ~700M                     | **OOM** for both `lag()` and self-join   |
+| ~3.5B                     | **OOM**, disk spill exceeded 166 GB      |
+
+The failure mode is the same whether you express it as `lag()` or as a self-join on `(person, week = week + 7 days)`:
+
+- `lag()` fails because the sort required to define "one row before" is too large.
+- A self-join fails because the hash table on `(person, week)` does not fit in memory.
+
+Both operations are O(N) or O(N log N) on the full table, and both blow the memory budget long before they finish. You need a strategy that works on slices.
+
+## The pattern: chunk by a person-hash bucket
+
+Partition people into _n_ buckets using a hash of the person ID, and process each bucket independently. Because the window is `PARTITION BY person`, every person's entire timeline falls within one bucket — there are no cross-bucket edge effects. On STP we use 10 buckets, which gives ~70M rows per bucket and fits comfortably in the 24 GB budget.
+
+One practical wrinkle: the hash-and-modulus belongs in the **view definition**, not in each dbplyr query. If you try to express `hash(x) %% 10 == b` through dbplyr on every iteration, it translates to DuckDB's `FMOD()` (floating-point modulus) because `%%` is not guaranteed to be integer, and DuckDB cannot optimise that filter into the parquet scan — so each bucket reads the whole corpus. Bake an integer `bucket` column into the view once, and every downstream query is a trivial `filter(bucket == b)`.
+
+```r
+library(duckdb); library(DBI); library(dplyr); library(dbplyr); library(purrr)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "my.duckdb", read_only = FALSE)
+dbExecute(con, "SET memory_limit = '20GB'")
+
+# One-off view definition: the bucket column is precomputed, so dbplyr
+# can filter on it as a plain integer column.
+dbExecute(con, "
+  CREATE OR REPLACE VIEW stp AS
+  SELECT *, CAST(hash(SYNTHETIC_AEUID) % 10 AS INTEGER) AS bucket
+  FROM read_parquet('stp/*.parquet')
+  WHERE ABN_HASH_TRUNC IS NOT NULL
+")
+
+stp <- tbl(con, "stp") |> rename_with(tolower)
+n_buckets <- 10
+
+# A single bucket, as a dbplyr pipeline.
+switches_one <- function(b) {
+  stp |>
+    filter(bucket == b) |>
+    select(synthetic_aeuid, week_ending, abn_hash_trunc) |>
+    group_by(synthetic_aeuid) |>
+    window_order(week_ending) |>
+    mutate(prev_employer = lag(abn_hash_trunc)) |>
+    ungroup() |>
+    filter(!is.na(prev_employer),
+           abn_hash_trunc != prev_employer)
+}
+
+# Run the 10 buckets and stack them into one persistent table.
+switches <- map(0:(n_buckets - 1), \(b) switches_one(b) |> compute()) |>
+  reduce(union_all) |>
+  compute(name = "switches", temporary = FALSE, overwrite = TRUE)
+```
+
+Every analytical step is tidyverse. `compute()` materialises each bucket's output into a small DuckDB temp table; `reduce(union_all)` stacks the ten temp tables into one lazy query; the final `compute(name = ..., temporary = FALSE)` writes the result out as a persistent table. The only SQL on the page is `CREATE VIEW` — one line, once — because there is no tidyverse verb that registers a parquet glob as a DuckDB view.
+
+Each iteration processes only 1/n of the people. The loop takes about 20 seconds end-to-end for the full 700M-row year, and ~100 seconds for the full 3.5B-row five-year STP corpus. Per-bucket timings are in [A4 §Chunked approach](A4-window-function-benchmarks.qmd#the-chunked-approach).
+
+::: {.callout-note}
+## Narrow the columns before the window
+The `select()` in `switches_one()` is not cosmetic. The sort buffer underneath `lag()` is proportional to the _row width_, not the column width — carrying 20 STP columns through a 70M-row window will OOM where 4 columns is comfortable. Project to exactly what the window and downstream filters need.
+:::
+
+::: {.callout-tip}
+## Choosing the number of buckets
+Aim for **50–100M rows per bucket**. More buckets = more iterations but safer memory. Fewer = fewer iterations but closer to the limit. On 32 GB with `memory_limit = '20GB'`, 10 buckets is a good default for STP.
+:::
+
+## `lag()` vs self-join: when each wins
+
+The chunked pattern works with either `lag()` or a self-join. They are not interchangeable.
+
+- **`lag()` looks back one _row_** within the ordered partition, whatever the time gap. Use this when the data has irregular spacing — some people with records every week, others every fortnight — and "the previous observation for this person" is genuinely what you want.
+- **A self-join on `(person, t = t + Δ)` looks back one _fixed time offset_** (e.g. exactly 7 days). Use this when the data has regular spacing by construction (weekly STP records), or when an irregular previous-observation would be misleading.
+
+For STP — weekly by construction — both give the same answer. At 70M rows per bucket, timings are within a few percent of each other. The self-join form stays tidyverse too: shift the "previous" week forward by 7 days, then join on equality.
+
+```r
+stp_b    <- stp |> filter(bucket == 0L)
+stp_prev <- stp_b |>
+  transmute(synthetic_aeuid,
+            week_ending   = week_ending + 7L,    # shift previous week forward
+            prev_employer = abn_hash_trunc)
+
+stp_b |>
+  inner_join(stp_prev, by = c("synthetic_aeuid", "week_ending")) |>
+  filter(abn_hash_trunc != prev_employer)
+```
+
+No `OVER (... ROWS BETWEEN ...)`, no `lag()`; just a plain inner join that DuckDB plans as a hash join.
+
+## Cross-dataset temporal joins: round to a common grain
+
+A related problem: you have an event table (job switches) and a fact table with irregular dates (MBS services). You want, for each event, the most recent service _before_ the event. The tidyverse-friendly way to handle this is to **round both sides to a common grain** — usually month — and join on equality. You pre-aggregate MBS to monthly totals per person, then inner-join switches to that monthly table on `(person, month)`.
+
+```r
+mbs_monthly <- mbs |>
+  mutate(month = floor_date(svcdate, unit = "month")) |>
+  group_by(synthetic_aeuid, month) |>
+  summarise(services = sum(numserv, na.rm = TRUE),
+            fees     = sum(feecharged, na.rm = TRUE), .groups = "drop")
+
+switches_m <- switches |>
+  mutate(month = floor_date(week_ending, unit = "month"))
+
+switches_m |>
+  inner_join(mbs_monthly, by = c("synthetic_aeuid", "month"))
+```
+
+For the exact "nearest record strictly before this event" semantics, DuckDB has `ASOF JOIN`. It is one of the very few operations this site flags as genuinely SQL-only; if you need it, use it via `dbGetQuery()`. For almost every question that starts "the most recent record before…", the round-to-month form above is clearer and enough.
+
+## Beyond DuckDB: streaming processors
+
+For production pipelines that need to process the full STP corpus on every data refresh, the next step up from chunked DuckDB is a custom streaming processor — typically in Rust, called from R via [extendr](https://extendr.github.io/rextendr/). A reader that walks sorted parquet files and maintains `(current_person, previous_employer)` state uses O(1) memory and runs at disk speed: no sorting, no hash tables, no chunking. It is overkill for exploratory work and exactly the right tool for a nightly pipeline.
+
+For everything on this site, chunked DuckDB with dbplyr is the recipe.
+
+## What lives in [A4](A4-window-function-benchmarks.qmd)
+
+- The failure log: `lag()` on 3.5B rows (disk-spill exhaustion); `lag()` on 700M rows (memory exhaustion); self-join on 700M rows (memory exhaustion).
+- Per-bucket timings for both `lag()` and the self-join approach on 70M-row buckets.
+- Projected timings across the full corpus.
+
+```{r disconnect}
+#| include: false
+invisible(dbExecute(con, "DROP TABLE IF EXISTS wk_panel"))
+dbDisconnect(con, shutdown = TRUE)
+```

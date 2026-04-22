@@ -1,0 +1,280 @@
+---
+title: "Joins"
+subtitle: "Linking tables, and using joins instead of other tools"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(arrow)
+  library(duckdb); library(DBI); library(dbplyr)
+  library(dplyr)
+  library(ggplot2); library(scales); library(knitr)
+})
+
+timings <- tibble()
+knitr::knit_hooks$set(time_it = function(before, options, envir) {
+  if (before) {
+    gc(full = TRUE, verbose = FALSE)
+    assign(".time_it_t0", Sys.time(), envir = envir)
+  } else {
+    secs <- as.numeric(difftime(Sys.time(), get(".time_it_t0", envir = envir), units = "secs"))
+    task <- options$time_it
+    approach <- if (!is.null(options$approach)) options$approach else "duckdb"
+    timings <<- bind_rows(timings, tibble(task = task, approach = approach, seconds = secs))
+    sprintf("\n::: {.callout-note appearance='minimal' collapse='false'}\n⏱️ **%s**: **%.3fs**\n:::\n", task, secs)
+  }
+})
+
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir     = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
+  read_only = TRUE
+)
+invisible(dbExecute(con, "SET threads TO 8"))
+invisible(dbExecute(con, "SET memory_limit = '20GB'"))
+
+itr_db     <- tbl(con, "itr")        |> rename_with(tolower)
+demo_db    <- tbl(con, "demo")       |> rename_with(tolower)
+ato_sp_db  <- tbl(con, "ato_spine")  |> rename_with(tolower)
+dhda_sp_db <- tbl(con, "dhda_spine") |> rename_with(tolower)
+mbs_db     <- tbl(con, "mbs")        |> rename_with(tolower)
+```
+
+Joins are the heart of PLIDA work. The whole reason the spine exists is to link tables. Most analyses end in a three-way join that mixes a small demographic table, a spine mapping, and a huge fact table.
+
+This chapter covers the join types that matter for PLIDA, the two habits that matter most (**push filters before joins**, and **use `semi_join`/`anti_join` instead of `filter(x %in% ...)`**), and the point at which Arrow stops and you need DuckDB. The evidence lives in [Appendix A3](A3-join-benchmarks.qmd).
+
+## Setup
+
+The running example is small enough that we can see the patterns clearly: _who was a manager (ANZSCO major 1) in 2014 and what were they doing in 2015?_ Two year-slices of ITR, ~1.5M and ~10M rows, joined on the ATO identifier.
+
+```{r managers-setup}
+mgrs_14 <- itr_db |>
+  filter(incm_yr == 2014L,
+         ocptn_grp_cd >= 1000L, ocptn_grp_cd < 2000L) |>
+  select(synthetic_aeuid, occ_14 = ocptn_grp_cd)
+
+y15 <- itr_db |>
+  filter(incm_yr == 2015L, !is.na(ocptn_grp_cd)) |>
+  select(synthetic_aeuid, occ_15 = ocptn_grp_cd)
+```
+
+Each of these is a lazy handle. Nothing has scanned a row yet.
+
+## The four "does it match?" joins
+
+### `inner_join()` — intersection
+
+Keep rows where the key exists on both sides. The pipeline below is every PLIDA transition question in miniature: what were 2014 managers doing in 2015?
+
+```{r inner-duckdb}
+#| time_it: "inner join (1.5M × 10M)"
+mgr_stayers <- mgrs_14 |>
+  inner_join(y15, by = "synthetic_aeuid") |>
+  mutate(
+    occ_major_15 = as.integer(floor(occ_15 / 1000)),
+    still_mgr    = occ_major_15 == 1L
+  ) |>
+  count(occ_major_15, still_mgr) |>
+  collect()
+head(mgr_stayers)
+```
+
+```{r plot-inner}
+#| fig-width: 8
+#| fig-height: 4.5
+occ_labels <- c(
+  "1" = "Managers", "2" = "Professionals", "3" = "Technicians",
+  "4" = "Community/personal", "5" = "Clerical/admin",
+  "6" = "Sales", "7" = "Machinery ops", "8" = "Labourers"
+)
+mgr_stayers |>
+  filter(occ_major_15 %in% 2:8) |>
+  mutate(occ_15_label = factor(occ_labels[as.character(occ_major_15)],
+                               levels = occ_labels)) |>
+  ggplot(aes(occ_15_label, n)) +
+  geom_col(fill = "#1b9e77") +
+  scale_y_continuous(labels = label_comma()) +
+  labs(x = "ANZSCO major group in 2015", y = "Managers in 2014",
+       title = "What managers did next (1-year)",
+       subtitle = "People who reported ANZSCO 1 in 2014, across their 2015 occupation") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### `left_join()` — every left row, matched or not
+
+Useful when you want non-matches too — "of 2014 managers, which ones did _not_ file in 2015?"
+
+```{r left-duckdb}
+#| time_it: "left join (1.5M × 10M)"
+mgr_all <- mgrs_14 |>
+  left_join(y15, by = "synthetic_aeuid") |>
+  mutate(filed_2015 = !is.na(occ_15)) |>
+  count(filed_2015) |>
+  collect()
+mgr_all
+```
+
+### `semi_join()` and `anti_join()` — filtering joins
+
+These are the most under-used verbs in the dplyr vocabulary for PLIDA work. `semi_join()` keeps rows from the left table that have at least one match on the right, without pulling the right-hand columns in. `anti_join()` keeps rows with no match.
+
+```{r anti-duckdb}
+#| time_it: "anti join (1.5M vs 10M)"
+mgr_exits <- mgrs_14 |>
+  anti_join(y15, by = "synthetic_aeuid") |>
+  summarise(n = n()) |>
+  collect()
+mgr_exits
+```
+
+```{r semi-duckdb}
+#| time_it: "semi join (1.5M vs 10M)"
+mgr_stayers_ct <- mgrs_14 |>
+  semi_join(y15, by = "synthetic_aeuid") |>
+  summarise(n = n()) |>
+  collect()
+mgr_stayers_ct
+```
+
+::: {.callout-important}
+## Use `semi_join()` / `anti_join()` instead of `filter(x %in% ...)`
+The obvious-looking alternative to a semi-join is:
+
+```r
+# DON'T — silently collects the right-hand column into R memory
+y15_keys <- y15 |> pull(synthetic_aeuid)
+mgrs_14 |> filter(synthetic_aeuid %in% y15_keys) |> summarise(n = n())
+```
+
+This is a landmine on large data. `pull()` (or the older `collect()$col` pattern) materialises the entire right-hand key column into an R vector. On a 10M-row `y15` that is already 160 MB; on a 372M-row MBS-keyed filter it breaks the machine. The `%in%` operator then ships that vector back to DuckDB as a literal list in the SQL — sometimes megabytes of `IN (...)` text — which is slow to parse and slow to execute.
+
+`semi_join()` / `anti_join()` keep the whole operation inside the engine: DuckDB builds a hash table on the key column, probes the left side, and returns the filtered rows. No R vector is built, no SQL literal is shipped.
+
+**Rule of thumb: if you find yourself writing `filter(x %in% (y |> pull(key)))`, it is a semi-join. Write the semi-join.**
+:::
+
+This is the first and most common way joins replace other data-manipulation tools. The second is de-duplication — `semi_join(y |> distinct())` is typically cheaper than a `distinct()` on the joined result. The third is set difference — `anti_join()` is exactly "in A but not in B".
+
+### `full_join()` — union of both sides
+
+Keep every row from both sides, filling `NA` where there is no match. The classic PLIDA diagnostic it answers: _how many people appear in the ATO spine but not the DHDA spine?_
+
+```{r full-duckdb}
+#| time_it: "full join (30M × 30M)"
+spine_coverage <- ato_sp_db |>
+  transmute(spine_id, in_ato = TRUE) |>
+  full_join(dhda_sp_db |> transmute(spine_id, in_dhda = TRUE), by = "spine_id") |>
+  mutate(in_ato  = coalesce(in_ato,  FALSE),
+         in_dhda = coalesce(in_dhda, FALSE)) |>
+  count(in_ato, in_dhda) |>
+  collect()
+spine_coverage
+```
+
+In the synthetic fplida corpus every person is present in every spine, so the off-diagonals are zero. On real PLIDA, the off-diagonals tell you how much attrition each spine is hiding — the reason to write this join in the first place.
+
+## The habit that matters most: push filters before joins
+
+The single change that most reliably makes a slow join fast on a large table is moving `filter()` calls upstream of the `join()`.
+
+```r
+# DON'T
+mbs_db |>
+  inner_join(dhda_sp_db, by = "synthetic_aeuid") |>
+  filter(svcdate >= "2015-01-01", svcdate < "2015-02-01")
+
+# DO
+mbs_db |>
+  filter(svcdate >= "2015-01-01", svcdate < "2015-02-01") |>
+  inner_join(dhda_sp_db, by = "synthetic_aeuid")
+```
+
+DuckDB's optimiser usually does this transformation for you — but not always, and Arrow's optimiser does not do it reliably at all. On Arrow, writing the filter after the join will often try to build a hash table on the entire 372M-row MBS table before applying the filter, which OOMs on a 32 GB machine. Writing the filter first lets the parquet reader prune row groups and only deliver the rows the join needs.
+
+Two corollaries:
+
+- **Select columns early.** If you only need `synthetic_aeuid` and `numserv` from MBS, say so before the join. Parquet is columnar, and DuckDB will read only the columns it needs — but only if you have told it which columns you need.
+- **Call `explain()` on anything slow.** If you cannot see the filter being pushed into the parquet scan in the plan, the filter is not being pushed. Rewrite.
+
+## The PLIDA three-table join
+
+The canonical analytical question joins three tables: demographics on the universal `spine_id`, an agency spine table to bridge identifiers, and a large fact table keyed on the agency identifier.
+
+```{r big-duckdb}
+#| time_it: "3-table join on MBS (372M)"
+big <- demo_db |>
+  select(spine_id, year_of_birth, core_gender) |>
+  inner_join(dhda_sp_db, by = "spine_id") |>
+  inner_join(mbs_db |> select(synthetic_aeuid, numserv, feecharged),
+             by = "synthetic_aeuid") |>
+  mutate(age_2015   = 2015L - year_of_birth,
+         age_decade = as.integer(floor(age_2015 / 10) * 10)) |>
+  filter(age_2015 >= 0L, age_2015 < 100L) |>
+  group_by(age_decade, core_gender) |>
+  summarise(services = sum(numserv,    na.rm = TRUE),
+            fees     = sum(feecharged, na.rm = TRUE),
+            claims   = n(), .groups = "drop") |>
+  collect()
+head(big)
+```
+
+```{r plot-big}
+#| fig-width: 8
+#| fig-height: 4.5
+big |>
+  filter(core_gender %in% c("M", "F")) |>
+  mutate(gender = if_else(core_gender == "F", "Female", "Male")) |>
+  ggplot(aes(age_decade, services / 1e6, fill = gender)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = label_comma(suffix = "M")) +
+  scale_fill_manual(values = c("Female" = "#E69F00", "Male" = "#56B4E9")) +
+  labs(x = "Age group (decades)", y = "MBS services, 2015", fill = NULL,
+       title = "MBS service use by age and sex, 2015",
+       subtitle = "30M × 30M × 372M, one DuckDB query") +
+  theme_minimal(base_size = 11)
+```
+
+Three tables, the largest 372M rows, 20 GB of memory budget. On the T3 benchmark ([A3](A3-join-benchmarks.qmd#t3-three-table-join)) DuckDB tables finish in about **4 seconds**; Arrow's Acero engine is killed by the OS part-way through building its hash table, and `dplyr` / `data.table` cannot even attempt the problem because the MBS parquet is larger than RAM.
+
+::: {.callout-important}
+## The size rule for joins
+Arrow's Acero engine is fine for joins whose hash tables fit in RAM. DuckDB handles joins whose hash tables **do not** fit in RAM, because it spills to disk via its buffer pool. On a 32 GB machine, the cut-off falls somewhere around the 372M-row MBS join: Arrow cannot do it, DuckDB does it in seconds.
+
+**Default to DuckDB for any PLIDA join that involves a real fact table. Arrow is the secondary engine for joins between small-to-medium tables.**
+:::
+
+## Speed tricks at the storage layer
+
+Two storage-layer choices affect join speed, but the gains depend on the query. Evidence in [A3 §Storage variants](A3-join-benchmarks.qmd#storage-variants).
+
+- **Sorting a fact table by the join key helps point lookups dramatically.** On the 371M-row MBS table, sorting by `SYNTHETIC_AEUID` made a single-person point lookup about **47×** faster, because DuckDB's zonemap pruning could skip all but one row group.
+- **It does not help broad analytical joins.** A three-way join filtered on `year_of_birth` gets no benefit from sorting MBS by AEUID, because people born in 1970 are uniformly distributed across AEUIDs — the build-side range covers the whole key space, and no zonemap can prune it.
+- **Integer keys are about 1.9× faster than 12-character string keys.** If repeated string-key joins dominate a workload, a hashed-integer surrogate key is worth benchmarking — though keep the original string around, because the hash is not formally collision-free.
+- **`PRIMARY KEY` does not help query performance.** DuckDB's ART index maintained by `PRIMARY KEY` / `UNIQUE` is there for integrity, not speed. It slows ingest (~4×) and does not accelerate joins. Declare constraints for correctness, not performance.
+
+## A quick recipe card
+
+- `inner_join()` for "matches on both sides".
+- `left_join()` for "every left row, matched or not".
+- `semi_join()` for "left rows with a match on the right" — use this instead of `filter(x %in% ...)`.
+- `anti_join()` for "left rows with no match on the right".
+- `full_join()` for the symmetric case — diagnostics, spine-coverage questions.
+- Put every `filter()` as close to the scan as possible. Select columns early.
+- For small/medium tables, Arrow and DuckDB both work. For anything that looks like a PLIDA fact-table join, use DuckDB.
+- Sort fact tables by the join key if your workload is dominated by point lookups. Don't otherwise.
+
+## What lives in [A3](A3-join-benchmarks.qmd)
+
+- T3: demo × dhda_spine × mbs (372M rows) across five backends.
+- Walkthrough timings for small inner / left / semi / anti / full joins.
+- Storage variants: baseline vs sorted vs integer-hash-keyed MBS, across point / narrow / full queries.
+- `PRIMARY KEY` variant build cost and query timings.
+
+```{r disconnect}
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+```

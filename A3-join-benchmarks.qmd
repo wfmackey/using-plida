@@ -1,0 +1,249 @@
+---
+title: "A3 · Join benchmarks"
+subtitle: "The three-way MBS join (T3) and storage-layout variants"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(fs); library(knitr); library(scales); library(ggplot2); library(tidyr)
+})
+bench_path <- file.path(paths$bench_dir, "benchmark-log.parquet")
+bench <- if (file_exists(bench_path)) latest_results(read_parquet(bench_path), c("task", "approach")) else tibble()
+
+var_path <- file.path(paths$bench_dir, "storage-variant-log.parquet")
+var_log <- if (file_exists(var_path)) latest_results(read_parquet(var_path), c("task", "approach")) else tibble()
+
+approach_levels <- c("dplyr", "datatable", "arrow", "duckdb_view", "duckdb_table")
+bench_t3 <- bench |> filter(task == "t3")
+```
+
+This appendix backs up the claims in [Joins](03-joins.qmd). Two experiments:
+
+1. **T3 — the three-way PLIDA join.** demo × dhda_spine × mbs, ~372M rows on the biggest table, across five backends in fresh R subprocesses.
+2. **Storage-layout variants.** How sorting, integer keys, and primary-key constraints change the same kind of query.
+
+## T3: three-table join
+
+The canonical PLIDA analytical question: link `demo` to MBS 2015 via `dhda_spine`, bucket people by decade of age, sum `NUMSERV`. Three tables, the heaviest (MBS) larger than RAM.
+
+We do not even _attempt_ `dplyr` or `data.table` here — loading 18.7 GB of MBS parquet into a tibble or `data.table` immediately blows the 32 GB memory budget. They are recorded as intentional skips.
+
+```{r t3-table}
+#| echo: false
+if (nrow(bench_t3) > 0) {
+  bench_t3 |>
+    mutate(approach = factor(approach, levels = approach_levels)) |>
+    arrange(approach) |>
+    transmute(
+      approach,
+      seconds = round(seconds, 2),
+      peak_rss_gb = round(rss_after_gb, 2),
+      rss_delta_gb = round(rss_delta_gb, 2),
+      n_result,
+      error = if_else(is.na(error), "", substr(error, 1, 60))
+    ) |>
+    kable()
+}
+```
+
+```{r t3-plot}
+#| echo: false
+#| fig-width: 8
+#| fig-height: 4
+if (nrow(bench_t3) > 0) {
+  bench_t3 |>
+    filter(is.na(error)) |>
+    mutate(approach = factor(approach, levels = approach_levels)) |>
+    ggplot(aes(approach, seconds, fill = approach)) +
+    geom_col() +
+    scale_y_continuous("Seconds") +
+    labs(x = NULL, title = "T3: three-way join, demo × dhda_spine × mbs (372M rows)") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 20, hjust = 1))
+}
+```
+
+In this run:
+
+- **Arrow did not complete the task at all.** The Acero join engine was killed by the OS on the 32 GB machine — the hash table on the MBS side exceeded the memory budget.
+- **DuckDB/view** (views over parquet) completed the join in about `6.4s`.
+- **DuckDB/table** (materialised storage) completed it in about `3.7s` — roughly twice as fast, because DuckDB owns the storage format, zonemaps, and compression.
+
+The view-vs-table gap on joins is the main reason [Reading and storing](01-reading-storing.qmd#step-3-load-the-parquet-into-duckdb) recommends materialising tables once the workload becomes join-heavy.
+
+The practical rule: **Arrow is fine for joins whose hash tables fit in RAM. DuckDB handles joins whose hash tables _cannot_ fit in RAM**, because it spills to disk via its buffer pool. On a 32 GB machine, that cutoff falls somewhere around the 372M-row MBS join.
+
+## Storage variants
+
+A separate experiment built four physical layouts of the fact table and two of the dimension table, all in `plida_variants.duckdb` (built by `R/05-storage-variants.R`, tasks run by `R/05b-run-variant-tasks.R`).
+
+| Variant             | What it is                                                                                 |
+|---------------------|--------------------------------------------------------------------------------------------|
+| `mbs_baseline`      | Straight copy of the parquet-ingested table (no explicit ordering)                         |
+| `mbs_sorted`        | `CREATE TABLE ... AS SELECT * FROM base.mbs ORDER BY SYNTHETIC_AEUID`                      |
+| `mbs_intkey`        | Adds `hash(SYNTHETIC_AEUID) AS aeuid_hash`, ordered by the hash                            |
+| `dhda_spine_intkey` | Matching hash column on the spine side — used for the integer-key join task                |
+| `dhda_spine_pk`     | `dhda_spine` with `PRIMARY KEY` on `spine_id` (for contrast; expect no query-side benefit) |
+
+### Build cost
+
+One-off, paid at ingest time:
+
+```{r variant-build}
+#| echo: false
+if (nrow(var_log) > 0) {
+  var_log |>
+    filter(task == "build") |>
+    transmute(
+      variant = approach,
+      seconds = round(seconds, 1),
+      db_size_gb = round(db_size_gb, 2),
+      peak_rss_gb = round(rss_after_gb, 2)
+    ) |>
+    kable()
+}
+```
+
+The sorted variant takes meaningfully longer to build than the baseline copy — DuckDB materialises a full `ORDER BY` on 371 M rows. Trade-off: pay once at build time for faster queries forever after, if those queries actually get faster.
+
+### Point lookup by AEUID
+
+The simplest test, and the one sorting is built for:
+
+```r
+tbl(con, variant) |>
+  filter(synthetic_aeuid == target) |>
+  summarise(n = n(), total_services = sum(numserv, na.rm = TRUE)) |>
+  collect()
+```
+
+On the unsorted table DuckDB must check every row group's zonemap, and since the AEUID min/max on an unsorted table spans the whole key space, no pruning happens and the query scans all 371 M rows. On the sorted table all but one row group is pruned.
+
+```{r point}
+#| echo: false
+if (nrow(var_log) > 0) {
+  var_log |>
+    filter(task == "point") |>
+    transmute(variant = approach,
+              seconds = round(seconds, 4),
+              peak_rss_gb = round(rss_after_gb, 2)) |>
+    kable()
+}
+```
+
+```{r point-plot}
+#| echo: false
+#| fig-width: 6
+#| fig-height: 3
+if (nrow(var_log) > 0 && any(var_log$task == "point")) {
+  var_log |>
+    filter(task == "point") |>
+    ggplot(aes(reorder(approach, -seconds), seconds, fill = approach)) +
+    geom_col() +
+    labs(x = NULL, y = "Seconds", title = "Point lookup: all MBS claims for one person") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none")
+}
+```
+
+Sorted is **roughly 50× faster than baseline** and the int-key variant matches it. This is the win the DuckDB docs promise, and it is exactly what zonemap pruning is designed for: a single-value filter on a sorted column touches essentially one row group. Use this kind of layout for any fact table where you routinely ask "tell me everything about _this_ person".
+
+### Narrow-filter three-way join (birth year 1970)
+
+Where I expected a big win and did not get one. The pipeline:
+
+```r
+demo |>
+  filter(year_of_birth == 1970L) |>
+  inner_join(dhda_spine, by = "spine_id") |>
+  inner_join(tbl(con, variant), by = "synthetic_aeuid") |>
+  summarise(n = n(), total_services = sum(numserv, na.rm = TRUE)) |>
+  collect()
+```
+
+Demo is filtered to ~500k people first, joined through `dhda_spine` to produce ~500k MBS keys, and the result probes MBS. The plan seems tailor-made for sorting to help: build a hash table on the small side, probe the giant table with a pushed-down min/max filter, done.
+
+```{r narrow}
+#| echo: false
+if (nrow(var_log) > 0) {
+  var_log |>
+    filter(task == "narrow") |>
+    transmute(variant = approach,
+              seconds = round(seconds, 3),
+              peak_rss_gb = round(rss_after_gb, 2)) |>
+    kable()
+}
+```
+
+Essentially no difference. Why?
+
+Because the **range** of AEUIDs on the build side is nearly the whole key space. People born in 1970 are uniformly distributed across the AEUID domain — birth year has nothing to do with how the PLIDA identifier was assigned. So the min/max of the build-side AEUIDs is roughly `[000000000000, FFFFFFFFFFFF]`, and that pushed-down filter does not actually prune anything. Every MBS row group still has to be probed, and we pay the full hash-join cost regardless of sort order.
+
+The general principle: **sorting the probe side only helps when the build side covers a tight range of the join key.** Filters that correlate with the join key (e.g. "give me all AEUIDs starting with `00001`") would benefit enormously. Filters that are statistically independent of the join key — birth year, gender, state of residence, most demographic filters — do not.
+
+### Full three-way join (every person)
+
+Same query but without the `WHERE`. Every person, bucketed by decade of age, summed over all of MBS 2015.
+
+```{r full3}
+#| echo: false
+if (nrow(var_log) > 0) {
+  var_log |>
+    filter(task == "full3") |>
+    transmute(variant = approach,
+              seconds = round(seconds, 3),
+              peak_rss_gb = round(rss_after_gb, 2)) |>
+    kable()
+}
+```
+
+The sorted variant is _slightly slower_ than baseline. Expected: with no filter, no row groups can be pruned, so there is nothing for the sort ordering to buy. The sort adds a small amount of I/O and compression-dictionary overhead that does not get amortised. Sorting is a pure cost in this regime.
+
+### Integer hash-key variant
+
+Same narrow-filter join as above, but joining on an integer `hash(SYNTHETIC_AEUID)` column rather than the 12-character hex string.
+
+```{r intkey}
+#| echo: false
+if (nrow(var_log) > 0) {
+  bind_rows(
+    var_log |> filter(task == "narrow", approach == "mbs_sorted") |>
+      mutate(variant = "string key (mbs_sorted)"),
+    var_log |> filter(task == "intkey_narrow") |>
+      mutate(variant = "int key (mbs_intkey)")
+  ) |>
+    transmute(variant, seconds = round(seconds, 3),
+              peak_rss_gb = round(rss_after_gb, 2)) |>
+    kable()
+}
+```
+
+The int-key variant is roughly **1.9× faster** than the string-key version of the same query — matching the docs' ~1.8× figure. This is a real win, but I would treat it as an optimisation rather than the default schema for the project: a hashed surrogate key adds a column to carry through the workflow, and unlike an exact integer recode it is not formally collision-free. **If repeated string-key joins dominate your workload, benchmark a numeric surrogate key.**
+
+### `PRIMARY KEY` variant
+
+We built `dhda_spine_pk` with `PRIMARY KEY (spine_id)`. The docs predict this will not help query performance, and we observe exactly that: the narrow-filter join run against `dhda_spine_pk` is indistinguishable from the run against plain `dhda_spine`. The ART index is maintained for integrity, not for joins.
+
+The only observation worth noting is build cost: the PK fill took noticeably longer than a plain `INSERT INTO` of the same data, and in our first attempt it failed outright because a handful of `dhda_spine` rows have `NULL` `spine_id` (which the constraint rejects). If you declare constraints, declare them because you want the integrity check; expect slower writes and no faster reads.
+
+## The short version
+
+1.  **Sort the fact table by the column you do point lookups on.** That is where sorting wins, dramatically, and the win is reliable.
+2.  **Sorting does not help every query.** It only helps when the filter produces a contiguous range of the sorted column. Demographic filters that are uncorrelated with the join key get no benefit.
+3.  **Sorting full-scan workloads is mildly harmful.** Do not sort tables that you only ever scan end-to-end.
+4.  **If repeated string-key joins dominate, benchmark a numeric surrogate key.** About 1.9× faster on this corpus.
+5.  **Do not declare `PRIMARY KEY` or `UNIQUE` for performance.** Declare them for correctness. Expect slower ingest and no query benefit.
+
+## Reproducing
+
+```bash
+Rscript R/04-run-benchmarks.R           # T3 plus T1/T2
+Rscript R/05-storage-variants.R         # build the variants DB
+Rscript R/05b-run-variant-tasks.R       # run the variant tasks
+```
+
+Writes `benchmarks/benchmark-log.parquet` and `benchmarks/storage-variant-log.parquet`.

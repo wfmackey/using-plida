@@ -1,0 +1,252 @@
+---
+title: "Data manipulation"
+subtitle: "dplyr verbs against a DuckDB database"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(arrow)
+  library(duckdb); library(DBI); library(dbplyr)
+  library(dplyr)
+  library(ggplot2); library(scales); library(tictoc); library(knitr)
+})
+
+timings <- tibble()
+knitr::knit_hooks$set(time_it = function(before, options, envir) {
+  if (before) {
+    gc(full = TRUE, verbose = FALSE)
+    assign(".time_it_t0", Sys.time(), envir = envir)
+  } else {
+    secs <- as.numeric(difftime(Sys.time(), get(".time_it_t0", envir = envir), units = "secs"))
+    task <- options$time_it
+    approach <- if (!is.null(options$approach)) options$approach
+                else if (grepl("-duckdb$", options$label)) "duckdb"
+                else if (grepl("-arrow$",  options$label)) "arrow"
+                else NA_character_
+    timings <<- bind_rows(timings, tibble(
+      task = task, approach = approach, seconds = secs
+    ))
+    sprintf("\n::: {.callout-note appearance='minimal' collapse='false'}\n⏱️ **%s** (%s): **%.3fs**\n:::\n", task, approach, secs)
+  }
+})
+
+pq <- paths$parquet_root
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir     = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
+  read_only = TRUE
+)
+invisible(dbExecute(con, "SET threads TO 8"))
+invisible(dbExecute(con, "SET memory_limit = '20GB'"))
+```
+
+Once the data is in parquet and DuckDB, the day-to-day work is ordinary `dplyr`: `filter`, `mutate`, `group_by`, `summarise`, `count`, `arrange`. The verbs look the same as on a tibble. The difference is where the computation happens — **the dplyr code is translated to SQL and executed inside DuckDB** — and that difference is the reason you can run these pipelines over 170-million-row tables without the laptop noticing.
+
+This chapter covers the everyday verbs, the small translation traps that bite once, and the escape hatches for the things dplyr does not cover. Joins and window functions get their own chapters. The evidence behind the speed and memory claims is in [Appendix A2](A2-data-manipulation-benchmarks.qmd).
+
+## The mental model: lazy query, eager `collect()`
+
+`tbl(con, "name")` returns a **lazy** dbplyr table. Every verb you apply extends a SQL query plan. Nothing runs until you call `collect()` (pulls the result into R as a tibble) or `compute()` (materialises into a temporary DuckDB table). The same pattern applies to Arrow — `open_dataset()` returns a lazy `arrow_dplyr_query`.
+
+```{r read-duckdb}
+# rename_with(tolower) lowercases SCREAMING_CASE columns so the rest of the
+# pipe can stay in snake_case. It is lazy — no data moves.
+itr_db     <- tbl(con, "itr")        |> rename_with(tolower)
+demo_db    <- tbl(con, "demo")       |> rename_with(tolower)
+ato_sp_db  <- tbl(con, "ato_spine")  |> rename_with(tolower)
+dhda_sp_db <- tbl(con, "dhda_spine") |> rename_with(tolower)
+```
+
+Two golden rules for getting this right:
+
+- **Keep the pipe lazy until the last step.** Every `collect()` in the middle of a pipeline forces DuckDB to run its plan and hand the result to R, where every subsequent verb runs in-memory without pushdown. Save `collect()` for the final, small object.
+- **Make the last step small.** A `collect()` on a billion-row query is a segfault waiting to happen. Aggregate, filter, or `slice_head()` first.
+
+Two useful diagnostics on a lazy object:
+
+```{r glimpse-db}
+glimpse(itr_db)
+```
+
+```r
+# See the SQL dbplyr will send
+itr_db |> filter(incm_yr == 2015L) |> count(ocptn_grp_cd) |> show_query()
+
+# Check the DuckDB query plan, including which filters are pushed down
+itr_db |> filter(incm_yr == 2015L) |> count(ocptn_grp_cd) |> explain()
+```
+
+`show_query()` prints the SQL; `explain()` prints the DuckDB optimiser plan. If a filter is not appearing at the leaf scan, the optimiser has not pushed it down — which usually means rewriting the pipe (see the join-ordering warning in the [joins chapter](03-joins.qmd)).
+
+## Filter and count: a single year of ITR
+
+A single year of ITR is about 10 million rows. Count the returns filed in 2015 by ANZSCO occupation major group.
+
+```{r filter-duckdb}
+#| time_it: "filter + count (10M)"
+itr_db |>
+  filter(incm_yr == 2015L, !is.na(ocptn_grp_cd)) |>
+  mutate(occ_major = as.integer(floor(ocptn_grp_cd / 1000))) |>
+  count(occ_major) |>
+  collect() |>
+  arrange(occ_major)
+```
+
+A fraction of a second. DuckDB pushes the `incm_yr == 2015L` predicate down to the row-group zonemap on the parquet reader (or the native storage, for a materialised table), so only rows for 2015 ever hit the engine. Peak memory stays flat: `dplyr-on-tibbles` would have paid ~250 MB to hold the whole year in RAM first.
+
+The T1 benchmark in [A2](A2-data-manipulation-benchmarks.qmd#t1-filter-and-count) shows this explicitly — DuckDB and Arrow both finish in well under a second while `dplyr`-on-tibbles takes 4+ seconds and materialises the year in memory.
+
+## Groupby across all years
+
+Same shape, now over 170 million rows spanning ten financial years.
+
+```{r groupby-duckdb}
+#| time_it: "groupby (170M)"
+occ_by_year_db <- itr_db |>
+  filter(!is.na(ocptn_grp_cd)) |>
+  mutate(occ_major = as.integer(floor(ocptn_grp_cd / 1000))) |>
+  count(incm_yr, occ_major) |>
+  collect()
+head(occ_by_year_db)
+```
+
+```{r plot-groupby}
+#| fig-width: 8
+#| fig-height: 4.5
+occ_labels <- c(
+  "1" = "Managers", "2" = "Professionals", "3" = "Technicians",
+  "4" = "Community/personal", "5" = "Clerical/admin",
+  "6" = "Sales", "7" = "Machinery operators", "8" = "Labourers"
+)
+
+occ_by_year_db |>
+  filter(occ_major %in% 1:8) |>
+  mutate(occ_label = factor(occ_labels[as.character(occ_major)], levels = occ_labels)) |>
+  ggplot(aes(incm_yr, n, colour = occ_label)) +
+  geom_line(linewidth = 0.7) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(x = "Income year", y = "Tax returns filed", colour = "ANZSCO major group",
+       title = "Returns by occupation group over a decade",
+       subtitle = "170M rows scanned in under a second") +
+  theme_minimal(base_size = 11)
+```
+
+The T2 benchmark ([A2 §T2](A2-data-manipulation-benchmarks.qmd#t2-groupby-across-all-years)) is where the regime changes become visible. `dplyr` on tibbles takes about 35 seconds and 14.5 GB of RAM — it has to load every row before grouping. DuckDB and Arrow both stream the scan and hold only the result (~1000 rows). That is roughly a 200× speed-up and a 50× memory reduction, on identical dplyr code, for changing one thing: what `tbl` points at.
+
+## `mutate()`: watch the backend translation
+
+`mutate()` is where the translators start to differ. Anything beyond simple arithmetic or string concatenation maps onto each engine's kernel catalogue, and the mapping is rarely identical. The innocuous expression "round a year down to the nearest decade" is the textbook trap.
+
+```{r mutate-duckdb}
+#| time_it: "mutate + arrange (30M)"
+gender_dist_db <- demo_db |>
+  filter(!is.na(year_of_birth)) |>
+  mutate(
+    # Use floor() explicitly — do NOT rely on as.integer() to truncate,
+    # because as.integer(x) means different things in R/arrow vs DuckDB.
+    birth_decade = as.integer(floor(year_of_birth / 10) * 10),
+    gender = case_when(
+      core_gender == "M" ~ "Male",
+      core_gender == "F" ~ "Female",
+      TRUE               ~ "Other/unknown"
+    )
+  ) |>
+  count(birth_decade, gender) |>
+  arrange(birth_decade, gender) |>
+  collect()
+head(gender_dist_db, 8)
+```
+
+::: {.callout-warning}
+## The `as.integer()` trap: truncate vs round
+An earlier draft of this pipeline used `as.integer(year_of_birth / 10) * 10L`. It looks equivalent to the `floor()` version but gives different answers across backends:
+
+- In R (and therefore in Arrow), `as.integer()` **truncates toward zero**: `as.integer(192.6) = 192`, so `1926` maps to decade `1920`.
+- In DuckDB, dbplyr translates `as.integer(...)` to SQL's `CAST(... AS INTEGER)`, which **rounds half-to-even**: `CAST(192.6 AS INTEGER) = 193`, so `1926` maps to decade `1930`.
+
+The consequence is silent and substantive. For this data, the "1920" Arrow bucket covered years 1920–1929 while the "1920" DuckDB bucket covered roughly 1915–1924, and the decade counts disagreed by tens of percent.
+
+**When you want truncation, say so explicitly with `floor()` (or `trunc()`); do not rely on `as.integer()` to do it for you across engines.** The same caution applies to `%/%`, `%%`, and bankers' rounding — all of which have backend-specific translations.
+:::
+
+A few patterns are worth knowing by heart because they translate cleanly:
+
+- `case_when()` and `if_else()` — both work, both produce clean SQL.
+- `stringr` helpers (`str_detect`, `str_sub`, `str_replace`) — work for most regex-free patterns.
+- Basic date parts: `year()`, `month()`, `day()` — both backends.
+- `coalesce()` — both backends.
+
+And a few that routinely need help:
+
+- **Integer division (`%/%`) and modulus (`%%`)** — Arrow's translator is unreliable. Use `floor(x / y)` and `x - floor(x / y) * y` for portability.
+- **Long-tail date arithmetic** — interval arithmetic, `lubridate` helpers beyond `year()`/`month()`/`day()` — DuckDB handles more than Arrow, but both can bail. If dbplyr does not translate cleanly, swap a `lubridate` call for an equivalent arithmetic one (e.g. `as.integer(difftime(a, b, units = "days"))` instead of a `%--%` interval).
+- **Rolling windows and frame clauses** — use `window_order()` + `window_frame(from, to)` in dbplyr; see the [Window functions chapter](04-window-functions.qmd).
+
+## When the translation fails
+
+You find out at `collect()` time: a query that looks valid raises a dbplyr translation error (or an Acero error under Arrow). The right response, in order of preference:
+
+1.  **Rewrite using primitives the engine supports.** The `floor()` example above. `stringr::str_c()` instead of `paste0()`. `coalesce()` instead of `ifelse()` for NULL handling. This covers almost every case you will meet.
+2.  **Last resort: drop a `sql()` fragment into a single `mutate()` or `filter()`.** This keeps the pipe in tidyverse but hands DuckDB one literal expression where there is no tidy alternative:
+
+    ```r
+    demo_db |>
+      mutate(age_bucket = sql("(2015 - YEAR_OF_BIRTH) / 10 * 10")) |>
+      count(age_bucket)
+    ```
+
+    Reserve this for the genuinely irreducible DuckDB-specific features — `QUALIFY`, rare aggregates, custom rollups. **If you find yourself writing more than one `sql(...)` per pipeline, rewrite the tidyverse side instead.**
+
+You should almost never reach for `dbGetQuery()` with a hand-written SQL string. Writing an entire query in raw SQL means you lose the lazy composition, the auto-tested translation, and the reader-familiar tidyverse syntax. It is reserved for DDL (creating tables once at ingest) and for the small set of operations that have no dbplyr equivalent at all.
+
+## Arrow as a secondary engine
+
+Arrow gives you the same dplyr surface over parquet _without_ a DuckDB connection. It is a legitimate alternative when:
+
+- You want to query parquet files in a directory without standing up a DuckDB database.
+- You are doing a linear read → filter → project → aggregate → write pipeline.
+- You need interop with Python / polars / pyarrow.
+
+```{r read-arrow}
+itr_ar <- open_dataset(file.path(pq, "itr_context")) |> rename_with(tolower)
+
+itr_ar |>
+  filter(incm_yr == 2015L, !is.na(ocptn_grp_cd)) |>
+  count(ocptn_grp_cd) |>
+  collect() |>
+  head()
+```
+
+For scans and simple groupbys Arrow and DuckDB are indistinguishable (see the walkthrough timings in [A2](A2-data-manipulation-benchmarks.qmd#walkthrough-timings)). The gap opens on joins and window functions — covered in the [joins](03-joins.qmd) and [window functions](04-window-functions.qmd) chapters respectively — and that is where DuckDB becomes the safe default.
+
+## Small result, large source: the whole point
+
+Most PLIDA analyses end in a plot or a small table. The pipeline should look like a pyramid: a wide, filtered scan at the bottom; aggregations squeezing the result down through the middle; a small `collect()` at the top. Everything below `collect()` runs in DuckDB; everything above runs in R.
+
+```r
+library(dplyr); library(dbplyr); library(ggplot2)
+
+tbl(con, "itr") |>
+  filter(incm_yr >= 2010L, !is.na(ocptn_grp_cd)) |>
+  mutate(occ_major = as.integer(floor(ocptn_grp_cd / 1000))) |>
+  count(incm_yr, occ_major) |>
+  collect() |>                               # ← here, and only here
+  ggplot(aes(incm_yr, n, colour = factor(occ_major))) +
+  geom_line()
+```
+
+The result that hits R is a few hundred rows. DuckDB did the work over 170M.
+
+## What lives in [A2](A2-data-manipulation-benchmarks.qmd)
+
+- T1: filter + count on one year of ITR — five backends side by side.
+- T2: groupby count over all ITR years — five backends side by side.
+- Walkthrough timings: DuckDB vs Arrow on the same dplyr code, across filter, groupby, mutate, and arrange.
+- Peak memory footprint for each approach.
+
+```{r disconnect}
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+```

@@ -12,26 +12,73 @@ This site is a work in progress. The code, benchmarks, and recommendations are s
 
 A worked demonstration of modern R data-engineering tools — [arrow](https://arrow.apache.org/docs/r/), [duckdb](https://duckdb.org/docs/api/r) / [dbplyr](https://dbplyr.tidyverse.org/), [data.table](https://rdatatable.gitlab.io/data.table/), and base [dplyr](https://dplyr.tidyverse.org/) — applied to PLIDA-style administrative microdata that is much larger than the machine's RAM. All code runs on a 32 GB MacBook against a ~750 GB synthetic PLIDA corpus produced by the [`fplida`](https://github.com/wfmackey/fplida) package.
 
-The site answers four practical questions:
-
-1.  Should CSVs be processed and stored as parquet before use?
-2.  Is it worth building a DuckDB database from the parquet files first, or should we just query the parquet with views?
-3.  Once the data is in place, which R idiom should you reach for — dplyr-on-tibbles, data.table, arrow, or dbplyr-over-DuckDB?
-4.  How do we do all of this without crashing a 32 GB RAM machine?
+Each main chapter describes one piece of the larger-than-memory workflow and shows the recommended way to do it. The evidence behind the recommendations — the timings, memory footprints, and the things we tried that did not work — lives in the benchmark appendices at the back of the book. Read the main chapters for the _what_ and _how_; dip into the appendices when you want the _why_.
 
 ## The short answer
 
-If you read only the recommendations page: convert CSV to parquet with DuckDB, not Arrow — the local six-file benchmark put DuckDB at about 2x faster for that step, with slightly smaller output. Keep the parquet layout disciplined (`zstd`, medium row groups, medium-sized files), then load the parquet into a DuckDB database for the join-heavy and repeated work, and do everything else with `dbplyr` over that DuckDB connection. Fall back to `arrow::open_dataset` or DuckDB views over parquet for ad-hoc exploration where spinning up a database is overkill, and reach for `data.table` only after you have filtered down to something that fits comfortably in memory.
+For PLIDA-style data on a machine with 32 GB of RAM:
 
-The rest of the site shows how we got there, with timings and memory footprints from real (synthetic) runs.
+1.  **Store raw data as parquet.** Convert CSV → parquet with DuckDB's `read_csv_auto()` piped into `COPY ... TO parquet`. It is roughly 2× faster than the Arrow equivalent on this corpus and writes slightly smaller files. Keep zstd compression, medium row groups (`ROW_GROUP_SIZE 250000`), and medium-sized output files. See [A1](A1-reading-storing-benchmarks.qmd).
+2.  **Put the parquet into a materialised DuckDB database** once the workload becomes repetitive or join-heavy. Set `memory_limit` explicitly (~60 % of physical RAM). Views over parquet are fine for one-off exploration. See [A1](A1-reading-storing-benchmarks.qmd).
+3.  **Query the database through `dbplyr`.** Compose dplyr verbs against `tbl(con, "name")`, call `collect()` only on the final small result, and drop into raw SQL (`dbGetQuery`, or `sql(...)` inside `mutate()`) for anything dbplyr will not translate. See [A2](A2-data-manipulation-benchmarks.qmd).
+4.  **Use filtering joins (`semi_join`, `anti_join`) instead of `filter(x %in% ...)`** when the right-hand side is large. Push `filter()` upstream of every join. Expect DuckDB to handle 100M+ row joins that Arrow cannot finish on a 32 GB machine. See [A3](A3-join-benchmarks.qmd).
+5.  **For window functions on billion-row panel data, chunk by a person-hash bucket.** A single `LAG()` over 700M STP rows does not fit; ten independent calls over 70M-row buckets complete in about 20 seconds. See [A4](A4-window-function-benchmarks.qmd).
 
-## How the pages fit together
+The rest of this site walks through each of those recommendations in turn.
 
-- [The data](01-the-data.qmd) — what the fplida corpus looks like, which tables we use, and the join model.
-- [CSV to parquet](02-csv-to-parquet.qmd) — how arrow streams a 44.5 GB CSV through a 2 GB memory footprint, and the cost/benefit of the conversion.
-- [DuckDB](03-duckdb.qmd) — two ways to wire parquet up to DuckDB (views vs materialised tables), and the build cost of each.
-- [Benchmarks](04-benchmarks.qmd) — five backends, three canonical tasks, timings and peak RSS.
-- [Recommendations](05-recommendations.qmd) — the rule of thumb, with caveats.
+## A very short introduction to DuckDB
+
+[DuckDB](https://duckdb.org/) is an in-process analytical database — the same idea as SQLite, but vectorised and columnar rather than row-based. You can think of it as a SQL engine that lives inside your R session: no server to stand up, no network, no client-server protocol. A database is a single file on disk, or it can run entirely in memory.
+
+For larger-than-memory PLIDA work three properties matter:
+
+- **Vectorised, columnar execution.** DuckDB operates on batches of column values at a time. Scans, filters, aggregations and joins are all expressed as operators over columnar chunks. That is what makes it competitive with — and usually faster than — `data.table` on in-memory work, and it is what lets it stream through parquet without materialising whole tables.
+- **A real query optimiser with spill-to-disk.** DuckDB plans queries, pushes filters into the parquet reader, and falls back to the buffer pool when a hash table does not fit in RAM. On a 32 GB machine that is the difference between a 372-million-row join completing in a few seconds and the process being killed by the OS.
+- **First-class parquet support.** DuckDB can read parquet directly, write parquet out, or ingest it into its own storage. Parquet stays the canonical format on disk and DuckDB is one of several engines that can read it.
+
+From R there are two main interfaces to DuckDB:
+
+```r
+library(duckdb); library(DBI); library(dplyr); library(dbplyr)
+
+con <- dbConnect(duckdb::duckdb(),
+                 dbdir = "plida_tables.duckdb",
+                 read_only = TRUE)
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET threads TO 8")
+
+# Write tidyverse R. DuckDB executes it.
+tbl(con, "itr") |>
+  filter(incm_yr == 2015L) |>
+  count(ocptn_grp_cd) |>
+  collect()
+```
+
+::: {.callout-note}
+## This site is tidyverse R, not SQL
+Every query in the main chapters and case studies is written in tidyverse syntax — `filter`, `mutate`, `group_by`, `summarise`, `inner_join`, `semi_join`, `lag`, `window_order`, `window_frame`. `dbplyr` translates those verbs into SQL and DuckDB executes them; you do not have to write SQL. The only exceptions are a small number of one-off **setup steps** where there is no tidyverse equivalent — CSV → parquet conversion (`COPY ... TO PARQUET`), connection pragmas (`SET memory_limit = ...`), and `CREATE TABLE` for the one-off ingest. Everything after that is dplyr.
+
+You can see the SQL that dbplyr generated for any lazy query with `show_query()`, and the DuckDB plan with `explain()`. Use these when something is slow; do not write the SQL yourself.
+:::
+
+Two knobs are worth setting on every connection:
+
+- **`SET memory_limit = '20GB'`** (or roughly 60 % of physical RAM). Without this, DuckDB will happily claim most of free memory, collide with R's heap, and the OS will kill one of them.
+- **`read_only = TRUE`** when attaching an already-built database for analysis. Multiple R sessions can attach the same `.duckdb` file read-only simultaneously — useful when you iterate in one session and render a Quarto document in another.
+
+The rest of the site assumes this is the default query engine and treats Arrow, dplyr-on-tibbles, and data.table as alternatives you reach for in specific situations.
+
+## How the chapters fit together
+
+The main chapters follow the life of a PLIDA query — from raw file to answer — and each chapter references the appendix that holds the evidence:
+
+- [Setup](00-setup.qmd) — install `fplida`, generate a synthetic corpus, set paths.
+- [Reading and storing raw data](01-reading-storing.qmd) — CSV → parquet → DuckDB, with a disciplined storage layout. Evidence in [A1](A1-reading-storing-benchmarks.qmd).
+- [Data manipulation](02-data-manipulation.qmd) — the dplyr verbs through `dbplyr` (and Arrow), and the small translation traps that bite once. Evidence in [A2](A2-data-manipulation-benchmarks.qmd).
+- [Joins](03-joins.qmd) — inner, left, semi, anti, full; when a `semi_join` replaces a `%in%` filter; when filters must be pushed before the join. Evidence in [A3](A3-join-benchmarks.qmd).
+- [Window functions](04-window-functions.qmd) — `lag()`, `row_number()`, rolling windows with `window_frame()`, and the chunk-by-hash pattern for billion-row panels. Evidence in [A4](A4-window-function-benchmarks.qmd).
+
+Four short case studies apply the recipe end-to-end: [earnings](cs01-earnings.qmd), [health services](cs02-health-services.qmd), [CSV to chart in 20 minutes](cs03-csv-to-chart.qmd), and [job switching and health shocks](cs04-job-switching.qmd).
 
 ## Reproducibility
 

@@ -7,54 +7,72 @@ subtitle: "A single-table workflow on individual tax returns"
 #| include: false
 source("R/00-paths.R")
 suppressPackageStartupMessages({
-  library(duckplyr)
+  library(duckdb); library(DBI); library(dplyr); library(dbplyr)
   library(ggplot2); library(scales); library(tictoc)
 })
 ```
 
-This case study works through a simple question: **what does the distribution of occupation groups look like in the individual tax returns?** It uses only the `itr` table — no joins, no spine files, just filtering and aggregating one big table. If you're picking up PLIDA for the first time, start here.
+This case study asks the most boring useful question you can ask of the individual tax returns: **what does the distribution of taxable income look like, and how has it moved over time?** It uses one table — `itr_inc`, the ATO income sub-table — and a few dplyr verbs. If you're picking up PLIDA for the first time, start here.
 
-## Read the data with duckplyr
+## Connect to DuckDB
 
-duckplyr can read parquet files directly — no DBI connection, no database setup. Just point it at the files:
+The [Reading and storing](01-reading-storing.qmd) chapter covers the one‑off setup: CSVs get converted to parquet with DuckDB, and the parquet is loaded into a materialised `plida_tables.duckdb` database. For every analysis from here on, we just open a read-only connection and grab a lazy handle to the table we want.
 
 ```{r connect}
-itr <- read_parquet_duckdb(
-  file.path(paths$parquet_root, "itr_context/*.parquet"),
-  prudence = "stingy"
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir = file.path(paths$duckdb_dir, "plida_tables.duckdb"),
+  read_only = TRUE
 )
+invisible(dbExecute(con, "SET memory_limit = '20GB'"))
+invisible(dbExecute(con, "SET threads TO 8"))
+
+itr_inc <- tbl(con, "itr_inc") |> rename_with(tolower)
 ```
 
-`itr` is now a lazy duckplyr frame backed by DuckDB. Nothing has been read into memory. You work with it using normal dplyr verbs — but the computation happens in DuckDB.
+`itr_inc` is a lazy `dbplyr` handle — it knows about the table but hasn't read a row. `rename_with(tolower)` lowercases the `SCREAMING_CASE` column names so the rest of the pipe reads cleanly in `snake_case`. Computation happens in DuckDB; the result comes back to R only when we say `collect()`.
 
 ::: {.callout-note}
-## What is `prudence = "stingy"`?
-By default, duckplyr will materialise results into R memory when you access them. Setting `prudence = "stingy"` prevents this — it keeps everything in DuckDB until you explicitly `collect()`. This is what you want for large data: it ensures you never accidentally pull 170 million rows into R.
+## Why a materialised DuckDB table and not views over parquet?
+For a single scan we would be fine either way. The reason the default recipe materialises tables is that most real analyses escalate: one filter today, a join tomorrow, a window function next week. Materialised storage pays once and is faster at everything after that. See [Reading and storing § Step 3](01-reading-storing.qmd#step-3-load-the-parquet-into-duckdb) and [A3 T3](A3-join-benchmarks.qmd#t3-three-table-join) for the evidence.
 :::
 
 ```{r glimpse}
-glimpse(itr)
+glimpse(itr_inc)
 ```
 
-Six columns, about 170 million rows across all financial years. `INCM_YR` is the financial year and `OCPTN_GRP_CD` is a 4-digit ANZSCO occupation code. This context table doesn't have taxable income directly — a common PLIDA experience: the column you want is in a different file. But we can do plenty with what we have.
+Four dollar columns (gross payments, business income, interest, and taxable income or loss) plus `synthetic_aeuid` and `incm_yr`. About 170 million rows across all financial years. The one to focus on is `ti_or_lss_amt` — **taxable income or loss**, the ATO's headline "how much did this person make, for tax purposes" number.
 
-## Count taxpayers by occupation group over time
+::: {.callout-note}
+## The ITR is split across four sub-tables
+`ato-pit_itr/` in the fplida corpus contains four distinct schemas: context (occupation code and residency), **income** (what we use here), deductions, and withholding/tax. The conversion step splits them into separate parquet subdirs before ingest, so we get four DuckDB tables — `itr`, `itr_inc`, `itr_ded`, `itr_whld` — that all share the `(synthetic_aeuid, incm_yr)` key. Any combined question joins them on that key.
+:::
 
-How many people file a tax return each year, broken down by ANZSCO major group (the first digit of the occupation code)?
+## Median taxable income by year
 
-```{r count-by-year}
-tic("Groupby on 170M rows")
-occ_by_year <- itr |>
-  filter(!is.na(OCPTN_GRP_CD)) |>
-  mutate(occ_major = as.integer(OCPTN_GRP_CD / 1000)) |>
-  summarise(n = n(), .by = c(INCM_YR, occ_major)) |>
+The simplest possible earnings question: what is the median taxable income in each financial year?
+
+```{r median-by-year}
+tic("Median + deciles on 170M rows")
+earnings_by_year <- itr_inc |>
+  filter(!is.na(ti_or_lss_amt)) |>
+  group_by(incm_yr) |>
+  summarise(
+    n         = n(),
+    mean_ti   = mean(ti_or_lss_amt, na.rm = TRUE),
+    median_ti = median(ti_or_lss_amt, na.rm = TRUE),
+    p10_ti    = quantile_cont(ti_or_lss_amt, 0.10),
+    p90_ti    = quantile_cont(ti_or_lss_amt, 0.90),
+    .groups = "drop"
+  ) |>
+  arrange(incm_yr) |>
   collect()
 toc()
 
-occ_by_year
+earnings_by_year
 ```
 
-Everything up to `collect()` is lazy — the dplyr chain builds a query that DuckDB executes. 170 million input rows collapse to a few hundred output rows. That is the pattern: push the heavy work to DuckDB, `collect()` only when the result fits in memory.
+Everything up to `collect()` is lazy — the dplyr chain builds a SQL query that DuckDB executes. 170 million input rows collapse to one row per year. That is the pattern: push the heavy work to DuckDB, `collect()` only when the result fits in memory.
 
 ::: {.callout-tip}
 ## The golden rule
@@ -62,59 +80,106 @@ Everything up to `collect()` is lazy — the dplyr chain builds a query that Duc
 :::
 
 ::: {.callout-note}
-## Why `as.integer(x / 1000)` instead of `x %/% 1000`?
-duckplyr doesn't translate R's integer division operator `%/%`. The workaround is `as.integer(x / y)`, which duckplyr handles natively. If you're using dbplyr (which we use in the later case studies for joins), `%/%` works fine — it translates to DuckDB's `FDIV()`. This is one of the small translation gaps between duckplyr and dbplyr.
+## `quantile_cont()` is a DuckDB function
+dbplyr translates `quantile_cont(x, p)` straight to DuckDB's `QUANTILE_CONT(x, p)` aggregate, which interpolates linearly between adjacent values — same semantics as base R's default `quantile()`. `median()` also translates, to DuckDB's `MEDIAN()`. Rolling percentiles combine `window_frame()` with `quantile_cont()` the same way; see [Window functions](04-window-functions.qmd).
 :::
 
-## Plot
+```{r plot-median}
+#| fig-width: 8
+#| fig-height: 4.5
+earnings_by_year |>
+  ggplot(aes(incm_yr)) +
+  geom_ribbon(aes(ymin = p10_ti, ymax = p90_ti), alpha = 0.15, fill = "#1b9e77") +
+  geom_line(aes(y = median_ti), colour = "#1b9e77", linewidth = 0.9) +
+  geom_line(aes(y = mean_ti),   colour = "#d95f02", linewidth = 0.7, linetype = 2) +
+  scale_y_continuous(labels = label_dollar(accuracy = 1)) +
+  labs(x = "Income year", y = "Taxable income (AUD)",
+       title = "Taxable income by year: median and 10–90% range",
+       subtitle = "Solid green: median. Dashed orange: mean. Band: P10–P90.") +
+  theme_minimal(base_size = 11)
+```
 
-Once you've `collect()`ed, you're back in normal R-land.
+Two things jump out even on synthetic data. The mean sits well above the median — the income distribution has a long upper tail, as it does in real ATO data. And the P10–P90 band is wide: the tenth and ninetieth percentiles differ by an order of magnitude.
 
-```{r plot-occ-year}
+## The income distribution, bucketed
+
+Medians and deciles are a nice summary, but for "how much do people earn?" it is usually clearer to count people in income brackets. Six brackets, one groupby.
+
+```{r brackets}
+tic("Income brackets by year on 170M rows")
+brackets <- itr_inc |>
+  filter(!is.na(ti_or_lss_amt)) |>
+  mutate(
+    bracket = case_when(
+      ti_or_lss_amt <        0 ~ "loss",
+      ti_or_lss_amt <    18200 ~ "<$18.2k",
+      ti_or_lss_amt <    45000 ~ "$18.2–45k",
+      ti_or_lss_amt <   120000 ~ "$45–120k",
+      ti_or_lss_amt <   180000 ~ "$120–180k",
+      TRUE                     ~ "$180k+"
+    )
+  ) |>
+  count(incm_yr, bracket) |>
+  collect()
+toc()
+
+head(brackets, 8)
+```
+
+`case_when()` translates cleanly into a SQL `CASE WHEN` expression; the `count()` adds a `GROUP BY` and a `COUNT(*)`. Same pattern as above, same shape of result.
+
+```{r plot-brackets}
 #| fig-width: 8
 #| fig-height: 5
-occ_labels <- c(
-  "1" = "Managers", "2" = "Professionals", "3" = "Technicians",
-  "4" = "Community/personal", "5" = "Clerical/admin",
-  "6" = "Sales", "7" = "Machinery operators", "8" = "Labourers"
-)
+bracket_levels <- c("loss", "<$18.2k", "$18.2–45k",
+                    "$45–120k", "$120–180k", "$180k+")
 
-occ_by_year |>
-  filter(occ_major %in% 1:8) |>
-  mutate(occ_label = occ_labels[as.character(occ_major)]) |>
-  ggplot(aes(INCM_YR, n, colour = occ_label)) +
-  geom_line(linewidth = 0.6) +
-  scale_y_continuous(labels = label_comma()) +
-  labs(x = "Income year", y = "Tax returns filed",
-       colour = "ANZSCO major group",
-       title = "Tax returns by occupation group over time",
+brackets |>
+  mutate(bracket = factor(bracket, levels = bracket_levels)) |>
+  ggplot(aes(incm_yr, n, fill = bracket)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  scale_fill_brewer(palette = "RdYlGn", direction = -1) +
+  labs(x = "Income year", y = "Share of returns", fill = "Taxable income",
+       title = "Share of individual tax returns by income bracket",
        subtitle = "fplida synthetic data, 30M person corpus") +
   theme_minimal(base_size = 11)
 ```
 
+The brackets track the tax-free threshold (\$18,200) and the old marginal rate cut-ins (\$45k, \$120k, \$180k). Reading the chart left to right tells you whether the distribution is compressing or spreading across years. On synthetic data the picture is stationary by construction; on real ATO data this is the first chart you draw.
+
 ## What just happened
 
-You queried 170 million rows, grouped by two variables, and plotted the result — without loading the data into R memory. The same operation with `read_parquet()` and dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM (see [benchmarks](04-benchmarks.qmd)). On a smaller machine it would crash.
+You aggregated 170 million rows twice and plotted both results — without loading the data into R memory. The same operation with `read_parquet()` and dplyr-on-tibbles takes about 35 seconds and 14.5 GB of RAM (see [A2](A2-data-manipulation-benchmarks.qmd)). On a smaller machine it would crash.
 
 ::: {.callout-important}
 ## The comparison that matters
-The same groupby on 170M rows: **dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM. duckplyr takes under a second and uses negligible memory.** See the full [benchmark results](04-benchmarks.qmd).
+The same groupby on 170M rows: **dplyr-on-tibbles takes 35 seconds and 14.5 GB of RAM. dbplyr over DuckDB takes under a second and uses negligible memory.** See the full [benchmark results](A2-data-manipulation-benchmarks.qmd).
 :::
 
 The workflow is always:
 
-1.  `read_parquet_duckdb()` to get a lazy handle.
-2.  dplyr verbs to build the query.
-3.  `collect()` to pull the (small) result into R.
+1.  Open a connection, grab a lazy `tbl()`.
+2.  Build the query with dplyr verbs.
+3.  `collect()` the (small) result into R.
 4.  ggplot2 from there.
 
-## duckplyr vs dbplyr: when to use which
+## What's next
 
-This case study uses **duckplyr** — it reads parquet directly and runs dplyr verbs through DuckDB with no database setup. For single-table operations like this, duckplyr is the simplest tool.
+The obvious follow-up — "how does taxable income vary _by occupation_?" — is a join between `itr_inc` and `itr` on `(synthetic_aeuid, incm_yr)`. Both tables share the ATO key, so no spine is involved. That is a good next exercise after reading the [Joins](03-joins.qmd) chapter.
 
-For **joins across large tables** (case studies 2–4), we switch to **dbplyr with a DBI connection** to a materialised DuckDB database. The reason: duckplyr's in-memory DuckDB engine runs out of memory on joins involving 30M+ rows per side on a 32 GB machine. A direct DBI connection to a `.duckdb` file lets DuckDB operate on its native storage with efficient buffer-pool paging — a fundamentally different memory profile. See [case study 2](cs02-health-services.qmd) for that approach.
+[Case study 2](cs02-health-services.qmd) is the first genuinely cross-agency join: linking demographics to MBS claims via the PLIDA spine.
 
-::: {.callout-note}
-## The rule of thumb
-**duckplyr** for single-table work (filter, mutate, groupby, summarise) — no setup, reads parquet directly, handles 170M rows easily. **dbplyr + DBI** for multi-table joins and window functions at scale — needs a materialised DuckDB database but handles operations duckplyr can't.
-:::
+## When you might reach for something else
+
+The default recipe above works for every single-table PLIDA question this project has thrown at it. Two alternatives are worth knowing about for specific situations:
+
+- **`arrow::open_dataset()`** is useful if you have parquet files on disk but haven't stood up a DuckDB database yet — for example, a one-off look at someone else's parquet extract. On scans and groupbys Arrow is indistinguishable from DuckDB ([A2](A2-data-manipulation-benchmarks.qmd)); it just gives up on large joins and window functions ([A3](A3-join-benchmarks.qmd), [A4](A4-window-function-benchmarks.qmd)).
+- **DuckDB views over parquet** give you the same dbplyr interface as this case study without materialising a table. Good for ad-hoc exploration of a parquet directory you don't want to ingest. See [Reading and storing § Step 3](01-reading-storing.qmd#step-3-load-the-parquet-into-duckdb).
+
+For anything you will run more than a couple of times, materialised tables plus `dbplyr` is the recipe the rest of this site uses.
+
+```{r disconnect}
+#| include: false
+dbDisconnect(con, shutdown = TRUE)
+```

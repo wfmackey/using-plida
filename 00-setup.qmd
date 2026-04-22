@@ -42,7 +42,7 @@ At 1 million people, joining MBS to demographics already involves 12 million cla
 
 ::: {.callout-note}
 ## Why CSV?
-fplida can output parquet directly, and parquet is faster to work with (as we show on the [CSV to parquet](02-csv-to-parquet.qmd) page). But most data in PLIDA is delivered as CSV. If you're learning these tools to prepare for working with real PLIDA data, generating CSV and converting it yourself is the more realistic exercise.
+fplida can output parquet directly, and parquet is faster to work with (as we show in the [Reading and storing](01-reading-storing.qmd) chapter). But most data in PLIDA is delivered as CSV. If you're learning these tools to prepare for working with real PLIDA data, generating CSV and converting it yourself is the more realistic exercise.
 :::
 
 fplida can write parquet directly or CSV:
@@ -119,6 +119,6 @@ install.packages(c(
 
 With the data generated and paths set, you're ready to go:
 
-- If you generated **CSV**, start with [CSV to parquet](02-csv-to-parquet.qmd) to convert your data.
-- If you generated **parquet** directly, skip to [DuckDB](03-duckdb.qmd) to build the database.
+- If you generated **CSV**, start with [Reading and storing](01-reading-storing.qmd) to convert your data and build the DuckDB database.
+- If you generated **parquet** directly, skip ahead to [Reading and storing § Step 3](01-reading-storing.qmd#step-3-load-the-parquet-into-duckdb) to build the database.
 - If you just want to see what this is all about, read the [case studies](cs01-earnings.qmd).

@@ -1,0 +1,206 @@
+---
+title: "A1 · Reading and storing benchmarks"
+subtitle: "CSV → parquet, parquet layout, DuckDB ingest"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(fs); library(ggplot2); library(scales); library(knitr); library(tidyr)
+})
+convert_log_path <- file.path(paths$bench_dir, "convert-log.parquet")
+convert_log <- if (file_exists(convert_log_path)) latest_results(read_parquet(convert_log_path), c("label", "file")) else tibble()
+
+backend_log_path <- file.path(paths$bench_dir, "csv-backend-log.parquet")
+backend_log <- if (file_exists(backend_log_path)) latest_results(read_parquet(backend_log_path), c("approach", "label")) else tibble()
+
+layout_log_path <- file.path(paths$bench_dir, "parquet-layout-log.parquet")
+layout_log <- if (file_exists(layout_log_path)) latest_results(read_parquet(layout_log_path), c("task", "variant", "engine")) else tibble()
+
+build_log_path <- file.path(paths$bench_dir, "duckdb-build-log.parquet")
+build_log <- if (file_exists(build_log_path)) latest_results(read_parquet(build_log_path), c("task", "approach", "label")) else tibble()
+```
+
+This appendix backs up the claims in [Reading and storing raw data](01-reading-storing.qmd). Three experiments, each with timings and peak resident-set size (RSS):
+
+1. Arrow vs DuckDB on CSV → parquet, across six large files.
+2. Per-file conversion log and scaling with CSV size.
+3. Parquet layout variants (zstd, row-group size, partitioning).
+4. DuckDB build cost for materialised tables vs views.
+
+All runs are on a 32 GB MacBook with local NVMe. Each backend is spawned in a fresh R subprocess so one run cannot pollute the next.
+
+## Arrow vs DuckDB on CSV to parquet
+
+The benchmark converts **six genuinely large source files** from this corpus — three MBS yearly claim files (`48-51 GB` each) and three STP yearly payroll files (`48 GB` each) — with each backend in turn. Both sides write zstd-compressed parquet with medium row groups and medium-sized output files. DuckDB uses `ROW_GROUP_SIZE 250000` and `ROW_GROUPS_PER_FILE 20`; Arrow uses `min_rows_per_group = max_rows_per_group = 250000L` and `max_rows_per_file = 5e6`.
+
+The benchmark lives in `R/10-benchmark-csv-backends.R` and logs to `benchmarks/csv-backend-log.parquet`.
+
+```{r backend-table}
+#| echo: false
+if (nrow(backend_log) > 0) {
+  backend_log |>
+    transmute(
+      label,
+      approach,
+      csv_gb = round(csv_gb, 1),
+      parquet_gb = round(parquet_gb, 2),
+      n_files,
+      seconds = round(seconds, 1),
+      rss_peak_gb = round(rss_peak_gb, 2)
+    ) |>
+    arrange(label, approach) |>
+    kable()
+}
+```
+
+```{r backend-summary}
+#| echo: false
+if (nrow(backend_log) > 0) {
+  backend_log |>
+    group_by(approach) |>
+    summarise(
+      files = n(),
+      mean_seconds = round(mean(seconds), 1),
+      median_seconds = round(median(seconds), 1),
+      mean_parquet_gb = round(mean(parquet_gb), 2),
+      mean_rss_gb = round(mean(rss_peak_gb), 2),
+      .groups = "drop"
+    ) |>
+    kable()
+}
+```
+
+The result is not close:
+
+- **DuckDB was about 2× faster on average.** Across the six files, Arrow averaged `130.0s`; DuckDB averaged `67.3s`.
+- **DuckDB wrote slightly smaller parquet.** Mean output size was `8.57 GB` for Arrow and `8.21 GB` for DuckDB on the same source files.
+- **Both stayed within the machine budget.** Arrow's peak RSS averaged `2.41 GB`; DuckDB's averaged `2.73 GB`.
+
+That is strong enough to change the project default. For this corpus, on this machine, **DuckDB is the better CSV → parquet converter** — and it is the recipe recommended in [Reading and storing](01-reading-storing.qmd#step-1-csv-to-parquet-using-duckdb).
+
+## Per-file conversion log
+
+Every file run through the production DuckDB conversion pipeline, with elapsed time, input size, and peak RSS.
+
+```{r convert-table}
+#| echo: false
+if (nrow(convert_log) > 0) {
+  convert_log |>
+    filter(!is.na(seconds), !is.na(csv_gb)) |>
+    transmute(
+      label,
+      approach,
+      file,
+      csv_gb     = round(csv_gb, 2),
+      parquet_gb = round(parquet_gb, 2),
+      ratio      = round(parquet_gb / csv_gb, 2),
+      seconds    = round(seconds, 1),
+      peak_rss_gb = round(rss_peak_gb, 2)
+    ) |>
+    arrange(desc(csv_gb)) |>
+    head(15) |>
+    kable()
+} else {
+  cat("(convert log not yet available — run R/01-convert-csv-to-parquet.R)")
+}
+```
+
+The headline row is the 44.5 GB MBS 2015 file converted to 18.7 GB of parquet in about 2 minutes with peak resident-set size under 2 GB. That is the whole point of the out-of-core path, regardless of engine: the file is an order of magnitude larger than the memory budget, and the budget never flinches.
+
+```{r convert-plot}
+#| echo: false
+#| fig-width: 7
+#| fig-height: 4
+if (nrow(convert_log) > 0) {
+  convert_log |>
+    filter(!is.na(seconds), !is.na(csv_gb)) |>
+    ggplot(aes(csv_gb, seconds)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.4) +
+    scale_x_continuous("CSV size (GB)", trans = "log10") +
+    scale_y_continuous("Conversion time (s)", trans = "log10") +
+    labs(title = "Conversion time scales linearly with CSV size",
+         subtitle = "out-of-core CSV -> parquet conversion") +
+    theme_minimal(base_size = 11)
+}
+```
+
+Across the files we converted, wall time is essentially linear in CSV size and peak RSS stays modest.
+
+## Parquet layout variants
+
+Parquet is not one format; it is a family of layouts, and the layout matters. We rewrote the 1.8 GB `itr_context` parquet in a few variants and reran one year-filter query plus one full groupby in both engines.
+
+```{r layout-table}
+#| echo: false
+if (nrow(layout_log) > 0) {
+  size_rows <- layout_log |>
+    filter(task %in% c("layout", "write")) |>
+    transmute(variant, size_gb) |>
+    distinct(variant, .keep_all = TRUE)
+
+  timing_rows <- layout_log |>
+    filter(task %in% c("year_filter", "full_groupby")) |>
+    transmute(variant, metric = paste(task, engine, sep = "_"), seconds) |>
+    pivot_wider(names_from = metric, values_from = seconds)
+
+  size_rows |>
+    left_join(timing_rows, by = "variant") |>
+    mutate(
+      variant = recode(
+        variant,
+        baseline_current = "current layout",
+        zstd_rg250k = "zstd + 250k row groups",
+        year_part_zstd_rg250k = "year partitions + zstd + 250k",
+        year_part_zstd_rg10k = "year partitions + zstd + 10k"
+      ),
+      across(where(is.double), ~ round(.x, 3))
+    ) |>
+    arrange(match(
+      variant,
+      c("current layout", "zstd + 250k row groups",
+        "year partitions + zstd + 250k", "year partitions + zstd + 10k")
+    )) |>
+    kable()
+}
+```
+
+Three takeaways:
+
+- **Explicit zstd is worth it.** On `itr_context`, the current layout was 1.82 GB; the explicit `zstd + 250k` rewrite was 1.22 GB.
+- **Year partitioning helps year filters when the table is actually multi-year.** On the same table, DuckDB's `incm_yr == 2015` count fell from about `0.080s` on the current layout to `0.028s` on the year-partitioned layout; Arrow moved from `0.076s` to `0.066s`.
+- **Tiny row groups are bad.** The `10k`-row-group variant made the full groupby much slower: Arrow went from about `0.149s` to `0.515s`, DuckDB from `0.100s` to `0.235s`.
+
+The absolute numbers are small because `itr_context` is only 1.8 GB, but the direction is the point. The practical rule: **use zstd, keep row groups medium-sized, and only partition on columns you actually filter on a lot.** For PLIDA that usually means year on multi-year panel-style tables; it does _not_ mean inventing partitions for a single-year fact table like MBS 2015.
+
+## DuckDB ingest: materialised tables and views
+
+Once parquet exists, the two ways to expose it to DuckDB are views (zero-copy, re-read on every query) and materialised tables (one-off ingest, native storage).
+
+Views build in a few milliseconds per view. Tables build in time linear in the input size:
+
+```{r build-table}
+#| echo: false
+if (nrow(build_log) > 0) {
+  build_log |>
+    filter(approach == "duckdb-table") |>
+    transmute(label,
+              seconds = round(seconds, 1),
+              peak_rss_gb = round(rss_peak_gb, 2),
+              db_size_gb = round(db_size_gb, 2),
+              n_rows = comma(n_rows)) |>
+    kable()
+}
+```
+
+Two observations:
+
+1.  **MBS dominates build time.** The 371 million MBS rows take about two minutes to ingest — about 17 MB/s from parquet into DuckDB storage. Everything else is near-instant by comparison.
+2.  **Peak RSS during ingest is bounded** at roughly the `memory_limit` set on the connection (here 20 GB). We set this explicitly because otherwise DuckDB will happily claim most of free RAM and collide with R.
+
+## What lives in other benchmark appendices
+
+Storage-layout variants that affect _joins_ specifically — sorting the fact table by the join key, integer surrogate keys, `PRIMARY KEY` — are in [A3](A3-join-benchmarks.qmd). The three everyday-dplyr workloads (filter, groupby, join) across five backends are split across [A2](A2-data-manipulation-benchmarks.qmd) and [A3](A3-join-benchmarks.qmd).

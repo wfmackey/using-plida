@@ -10,22 +10,25 @@ website:
         text: Overview
       - href: 00-setup.qmd
         text: Setup
-      - href: 01-the-data.qmd
-        text: The data
-      - href: 02-csv-to-parquet.qmd
-        text: CSV to Parquet
-      - href: 03-duckdb.qmd
-        text: DuckDB
-      - href: 03b-walkthrough.qmd
-        text: Walkthrough
-      - href: 04-benchmarks.qmd
-        text: Benchmarks
-      - href: 04b-storage-layout.qmd
-        text: Storage layout
-      - href: 04c-window-strategies.qmd
-        text: Window strategies
-      - href: 05-recommendations.qmd
-        text: Recommendations
+      - href: 01-reading-storing.qmd
+        text: 1. Reading & storing
+      - href: 02-data-manipulation.qmd
+        text: 2. Data manipulation
+      - href: 03-joins.qmd
+        text: 3. Joins
+      - href: 04-window-functions.qmd
+        text: 4. Window functions
+      - text: "---"
+      - text: Benchmarks
+        menu:
+          - href: A1-reading-storing-benchmarks.qmd
+            text: "A1: Reading & storing"
+          - href: A2-data-manipulation-benchmarks.qmd
+            text: "A2: Data manipulation"
+          - href: A3-join-benchmarks.qmd
+            text: "A3: Joins"
+          - href: A4-window-function-benchmarks.qmd
+            text: "A4: Window functions"
       - text: "---"
       - text: Case studies
         menu:

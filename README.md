@@ -10,21 +10,26 @@ PLIDA corpus at 30M individuals (~751 GB of CSV on disk). On this machine
 
 ## Layout
 
-| Path                            | Purpose                                                 |
-|---------------------------------|---------------------------------------------------------|
-| `index.qmd`                     | Overview and short answer                               |
-| `01-the-data.qmd`               | fplida, the subset we use, and the join model           |
-| `02-csv-to-parquet.qmd`         | CSV → parquet, with Arrow vs DuckDB comparison         |
-| `03-duckdb.qmd`                 | Building DuckDB from parquet; views vs materialised     |
-| `04-benchmarks.qmd`             | 5 backends × 3 tasks, timings and peak RSS              |
-| `05-recommendations.qmd`        | The rule of thumb                                       |
-| `R/00-paths.R`                  | Centralised paths                                       |
-| `R/helpers.R`                   | Timing and memory-measurement utilities                 |
-| `R/01-convert-csv-to-parquet.R` | DuckDB CSV → parquet (itr + mbs)                       |
-| `R/01b-convert-supplementary.R` | Demo + id-linker spine conversions                      |
-| `R/02-build-duckdb.R`           | Build `plida_views.duckdb` and `plida_tables.duckdb`    |
-| `R/03-benchmarks.R`             | Benchmark functions, runnable per (task, backend)       |
-| `R/04-run-benchmarks.R`         | Driver that runs each pair in a fresh subprocess        |
+| Path                                 | Purpose                                                                 |
+|--------------------------------------|-------------------------------------------------------------------------|
+| `index.qmd`                          | Overview, summary of recommendations, introduction to DuckDB            |
+| `00-setup.qmd`                       | Installing fplida, generating a synthetic corpus, setting paths         |
+| `01-reading-storing.qmd`             | CSV → parquet → DuckDB, with storage-layout best practices              |
+| `02-data-manipulation.qmd`           | dplyr verbs through dbplyr and Arrow                                    |
+| `03-joins.qmd`                       | Join types; using `semi_join`/`anti_join` instead of `filter(x %in% ...)` |
+| `04-window-functions.qmd`            | `lag()`, rolling windows, chunk-by-hash for billion-row data            |
+| `A1-reading-storing-benchmarks.qmd`  | Arrow vs DuckDB convert, parquet layout, DuckDB ingest timings          |
+| `A2-data-manipulation-benchmarks.qmd`| T1 filter + T2 groupby across 5 backends                                |
+| `A3-join-benchmarks.qmd`             | T3 three-way join + storage-variant experiments                         |
+| `A4-window-function-benchmarks.qmd`  | `lag()` / self-join / chunked strategies on billion-row STP             |
+| `cs01`–`cs04.qmd`                    | End-to-end case studies                                                 |
+| `R/00-paths.R`                       | Centralised paths                                                       |
+| `R/helpers.R`                        | Timing and memory-measurement utilities                                 |
+| `R/01-convert-csv-to-parquet.R`      | DuckDB CSV → parquet (itr + mbs)                                        |
+| `R/01b-convert-supplementary.R`      | Demo + id-linker spine conversions                                      |
+| `R/02-build-duckdb.R`                | Build `plida_views.duckdb` and `plida_tables.duckdb`                    |
+| `R/03-benchmarks.R`                  | Benchmark functions, runnable per (task, backend)                       |
+| `R/04-run-benchmarks.R`              | Driver that runs each pair in a fresh subprocess                        |
 
 ## Data locations
 

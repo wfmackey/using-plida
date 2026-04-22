@@ -20,12 +20,9 @@ con <- dbConnect(
 
 This case study asks: **how does MBS service use vary by sex and age?** It's the simplest genuinely useful PLIDA question that requires joining across datasets — demographics from one source, health service use from another, linked via the spine.
 
-The MBS 2015 claims file has 372 million rows. Loading it into memory is not an option on a 32 GB machine — we tested that in the [benchmarks](04-benchmarks.qmd), and even arrow's join engine was killed by the operating system. DuckDB handles the whole thing in a few seconds.
+The MBS 2015 claims file has 372 million rows. Loading it into memory is not an option on a 32 GB machine — we tested that in the [join benchmarks](A3-join-benchmarks.qmd), and even arrow's join engine was killed by the operating system. DuckDB handles the whole thing in a few seconds.
 
-::: {.callout-note}
-## Why dbplyr, not duckplyr?
-[Case study 1](cs01-earnings.qmd) used duckplyr to read parquet directly — no database needed. That works beautifully for single-table operations. For joins across large tables, duckplyr's in-memory DuckDB engine runs out of memory on a 32 GB machine (the hash tables for a 30M × 372M join exceed the ~18 GB it allocates). dbplyr with a DBI connection to a materialised `.duckdb` file lets DuckDB operate on its native storage with efficient buffer-pool paging. This is the right tool when tables get big.
-:::
+This is the standard recipe from the [Joins](03-joins.qmd) chapter: a read-only connection to the materialised DuckDB database, three lazy `tbl()` handles, dbplyr verbs, `collect()` at the end. Everything else that follows in this case study is just choosing the right joins and pushing filters to the right place.
 
 ## The PLIDA join model
 
@@ -45,12 +42,12 @@ No single agency holds a universal person identifier. The spine tables are the l
 ## Set up the lazy tables
 
 ```{r tables}
-demo       <- tbl(con, "demo")
-dhda_spine <- tbl(con, "dhda_spine")
-mbs        <- tbl(con, "mbs")
+demo       <- tbl(con, "demo")       |> rename_with(tolower)
+dhda_spine <- tbl(con, "dhda_spine") |> rename_with(tolower)
+mbs        <- tbl(con, "mbs")        |> rename_with(tolower)
 ```
 
-Three handles. Nothing loaded. Let's check what we're working with:
+Three handles. Nothing loaded. `rename_with(tolower)` pushes every column to `snake_case` as it comes out of DuckDB, so the rest of the pipe can stay lowercase. Let's check what we're working with:
 
 ```{r peek}
 demo |> head(3) |> collect()
@@ -65,24 +62,21 @@ For each sex and 5-year age bracket, how many MBS services were used in 2015 and
 ```{r query}
 tic("Three-table join on 372M MBS rows")
 result <- demo |>
-  select(SPINE_ID, CORE_GENDER, YEAR_OF_BIRTH) |>
+  select(spine_id, core_gender, year_of_birth) |>
+  inner_join(dhda_spine, by = "spine_id") |>
   inner_join(
-    dhda_spine |> rename(SPINE_ID = spine_id),
-    by = "SPINE_ID"
-  ) |>
-  inner_join(
-    mbs |> select(SYNTHETIC_AEUID, NUMSERV, FEECHARGED),
-    by = "SYNTHETIC_AEUID"
+    mbs |> select(synthetic_aeuid, numserv, feecharged),
+    by = "synthetic_aeuid"
   ) |>
   mutate(
-    age_2015  = 2015L - YEAR_OF_BIRTH,
-    age_group = (age_2015 %/% 5L) * 5L
+    age_2015  = 2015L - year_of_birth,
+    age_group = as.integer(floor(age_2015 / 5) * 5)
   ) |>
   filter(age_2015 >= 0L, age_2015 < 100L) |>
-  group_by(CORE_GENDER, age_group) |>
+  group_by(core_gender, age_group) |>
   summarise(
-    services    = sum(NUMSERV, na.rm = TRUE),
-    fee_charged = sum(FEECHARGED, na.rm = TRUE),
+    services    = sum(numserv, na.rm = TRUE),
+    fee_charged = sum(feecharged, na.rm = TRUE),
     claims      = n(),
     .groups = "drop"
   ) |>
@@ -98,25 +92,31 @@ Here's the SQL dbplyr generated:
 
 ```{r show-sql}
 demo |>
-  select(SPINE_ID, CORE_GENDER, YEAR_OF_BIRTH) |>
-  inner_join(dhda_spine |> rename(SPINE_ID = spine_id), by = "SPINE_ID") |>
-  inner_join(mbs |> select(SYNTHETIC_AEUID, NUMSERV, FEECHARGED), by = "SYNTHETIC_AEUID") |>
-  mutate(age_2015 = 2015L - YEAR_OF_BIRTH, age_group = (age_2015 %/% 5L) * 5L) |>
+  select(spine_id, core_gender, year_of_birth) |>
+  inner_join(dhda_spine, by = "spine_id") |>
+  inner_join(mbs |> select(synthetic_aeuid, numserv, feecharged), by = "synthetic_aeuid") |>
+  mutate(age_2015 = 2015L - year_of_birth,
+         age_group = as.integer(floor(age_2015 / 5) * 5)) |>
   filter(age_2015 >= 0L, age_2015 < 100L) |>
-  group_by(CORE_GENDER, age_group) |>
-  summarise(services = sum(NUMSERV, na.rm = TRUE), fee_charged = sum(FEECHARGED, na.rm = TRUE),
+  group_by(core_gender, age_group) |>
+  summarise(services = sum(numserv, na.rm = TRUE),
+            fee_charged = sum(feecharged, na.rm = TRUE),
             claims = n(), .groups = "drop") |>
   show_query()
 ```
 
 ## Things to notice
 
-::: {.callout-tip}
-## The `rename()` trick for mismatched columns
-The demo table uses `SPINE_ID`; the spine table uses `spine_id` (lowercase). Just `rename()` on the lazy table before joining — dbplyr will emit the appropriate `AS` clause. You'll use this constantly in PLIDA work.
-:::
+**Normalise column case up front.** `rename_with(tolower)` at the top of each `tbl()` means the rest of the pipe joins on `spine_id` and `synthetic_aeuid` without any one-off renames. That is the idiom the book uses throughout ([Data manipulation § The mental model](02-data-manipulation.qmd#the-mental-model-lazy-query-eager-collect)).
 
 **`select()` before joining.** We select only the columns we need from each table _before_ the join. DuckDB pushes the projection down, so it reads fewer columns from disk and the hash table is smaller.
+
+**Filters also go before joins.** The `age_2015 >= 0` filter is on the already-joined result here because the column only exists after the mutate, but where a filter exists on a raw column (e.g. `year_of_birth >= 1960`), push it upstream of every join. Arrow's optimiser will not do this transformation for you; see [Joins § The habit that matters most](03-joins.qmd#the-habit-that-matters-most-push-filters-before-joins).
+
+::: {.callout-important}
+## `semi_join()` / `anti_join()` instead of `filter(x %in% ...)`
+Not used here, but worth calling out because it is the single most useful join idiom for PLIDA work. If you ever find yourself writing `filter(synthetic_aeuid %in% (other_table |> pull(synthetic_aeuid)))`, rewrite it as `semi_join(other_table, by = "synthetic_aeuid")`. The `%in%` form silently materialises the right‑hand column into R memory and ships a giant `IN (...)` literal back in SQL; the `semi_join()` keeps the whole operation inside DuckDB. See [Joins § filtering joins](03-joins.qmd#semi_join-and-anti_join-filtering-joins).
+:::
 
 ::: {.callout-warning}
 ## `collect()` comes last — not in the middle
@@ -129,8 +129,8 @@ If you accidentally write `demo |> collect() |> inner_join(dhda_spine, ...)`, yo
 #| fig-width: 8
 #| fig-height: 5
 result |>
-  filter(CORE_GENDER %in% c("M", "F")) |>
-  ggplot(aes(age_group, services / 1e6, fill = CORE_GENDER)) +
+  filter(core_gender %in% c("M", "F")) |>
+  ggplot(aes(age_group, services / 1e6, fill = core_gender)) +
   geom_col(position = "dodge") +
   scale_y_continuous(labels = label_comma(suffix = "M")) +
   scale_fill_manual(values = c("F" = "#E69F00", "M" = "#56B4E9"),
@@ -146,9 +146,9 @@ result |>
 #| fig-width: 8
 #| fig-height: 5
 result |>
-  filter(CORE_GENDER %in% c("M", "F")) |>
+  filter(core_gender %in% c("M", "F")) |>
   mutate(fee_per_service = fee_charged / services) |>
-  ggplot(aes(age_group, fee_per_service, colour = CORE_GENDER)) +
+  ggplot(aes(age_group, fee_per_service, colour = core_gender)) +
   geom_line(linewidth = 0.8) +
   geom_point(size = 1.5) +
   scale_y_continuous(labels = label_dollar()) +
@@ -163,38 +163,20 @@ result |>
 
 ## When dbplyr is not enough
 
-Most of the time dplyr verbs translate cleanly. But when they don't — a DuckDB-specific function, a tricky window frame, or just a case where the translation is wrong — you have two escape hatches.
-
-**Option 1: `sql()` inside the pipe.** Drop a raw SQL fragment into a `mutate()` or `filter()`:
+For the vast majority of PLIDA questions, dplyr verbs translate cleanly. When they do not — typically a DuckDB-specific function with no tidy counterpart — the lightest escape is a single `sql()` fragment inside a `mutate()` or `filter()`:
 
 ```r
 demo |>
-  mutate(something = sql("SOME_DUCKDB_FUNCTION(col)")) |>
-  ...
+  mutate(something = sql("SOME_DUCKDB_FUNCTION(col)"))
 ```
 
-You stay in the dplyr pipe but hand DuckDB literal SQL for that one expression.
-
-**Option 2: `dbGetQuery()` for the whole thing.** When the SQL is clearer than the dplyr equivalent:
-
-```r
-dbGetQuery(con, "
-  SELECT CORE_GENDER, (2015 - YEAR_OF_BIRTH) / 5 * 5 AS age_group,
-         SUM(NUMSERV) AS services
-  FROM demo d
-  JOIN dhda_spine ds ON d.SPINE_ID = ds.spine_id
-  JOIN mbs m ON ds.SYNTHETIC_AEUID = m.SYNTHETIC_AEUID
-  GROUP BY CORE_GENDER, age_group
-")
-```
-
-There is no prize for forcing everything through dbplyr. Use what's clearest.
+You stay in the dplyr pipe and hand DuckDB a literal expression for that one column. Reserve it for the genuinely irreducible case; if more than one `sql(...)` appears in a pipeline, rewrite the tidyverse side instead. `dbGetQuery()` with a hand-written SQL query is almost never the right answer — it is used once in the site for `ASOF JOIN` and not elsewhere.
 
 ## A note on table layout
 
-We found in the [storage layout](04b-storage-layout.qmd) experiments that sorting MBS by the join key makes point lookups 47× faster but doesn't speed up broad analytical queries like this one. If you're looking up one specific person's claims, sort the table. For population-level analysis, it doesn't matter.
+We found in the [storage-layout join experiments](A3-join-benchmarks.qmd#storage-variants) that sorting MBS by the join key makes point lookups 47× faster but doesn't speed up broad analytical queries like this one. If you're looking up one specific person's claims, sort the table. For population-level analysis, it doesn't matter.
 
-The one thing that helps _every_ join: using an [integer hash key](04b-storage-layout.qmd) instead of the string AEUID. We measured a 2× speedup.
+The one thing that helps _every_ join: using an [integer hash key](A3-join-benchmarks.qmd#integer-hash-key-variant) instead of the string AEUID. We measured a 2× speedup.
 
 ```{r disconnect}
 #| include: false

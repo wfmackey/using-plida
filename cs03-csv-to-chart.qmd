@@ -35,50 +35,54 @@ tibble(
 
 ::: {.callout-warning}
 ## Do not `read_csv()` a PLIDA file
-It is tempting. You have done it a thousand times on smaller data. But a single MBS year file is 44.5 GB — far more than your machine's 32 GB of RAM. Even a "medium" ITR file will eat several GB and slow everything else down. Use arrow's streaming reader instead (next step).
+It is tempting. You have done it a thousand times on smaller data. But a single MBS year file is 44.5 GB — far more than your machine's 32 GB of RAM. Even a "medium" ITR file will eat several GB and slow everything else down. Use DuckDB's streaming CSV reader instead (next step).
 :::
 
 ## Step 2: Convert the CSVs you need to parquet
 
-You almost certainly do not need all 34 datasets. Pick the ones relevant to your question and convert them. We covered why parquet is better than CSV on the [CSV to parquet](02-csv-to-parquet.qmd) page — the short version is: smaller, faster, typed, and columnar.
+You almost certainly do not need all 34 datasets. Pick the ones relevant to your question and convert them. We covered why parquet is better than CSV in the [Reading and storing](01-reading-storing.qmd#step-1-csv-to-parquet-using-duckdb) chapter — the short version is: smaller, faster, typed, and columnar.
 
-The conversion uses arrow's streaming reader, which never loads the full file into memory. Even the 44.5 GB MBS file converts in 2 minutes with under 2 GB of RAM (see the [conversion benchmarks](02-csv-to-parquet.qmd)).
+The recommended converter is **DuckDB's streaming CSV reader** piped into `COPY ... TO parquet`. On the six‑file benchmark in [A1](A1-reading-storing-benchmarks.qmd#arrow-vs-duckdb-on-csv-to-parquet) it was about 2× faster than Arrow for this step, wrote slightly smaller parquet, and stayed under 3 GB of RAM on a 44.5 GB source file.
 
 Here is the recipe for one file:
 
 ```r
-library(arrow)
+library(duckdb); library(DBI)
 
-# This is lazy — nothing is read yet
-ds <- open_csv_dataset("path/to/big-file.csv")
+con <- dbConnect(duckdb::duckdb())
+dbExecute(con, "SET threads TO 8")
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET preserve_insertion_order = false")
 
-# This streams: arrow reads batches from the CSV and writes them straight
-# to parquet. Memory stays flat regardless of file size.
-write_dataset(
-  ds,
-  path = "output/dir/",
-  format = "parquet",
-  basename_template = "my-table-{i}.parquet",
-  max_rows_per_file = 5e6,
-  existing_data_behavior = "overwrite"
-)
+dbExecute(con, "
+  COPY (
+    SELECT * FROM read_csv_auto('path/to/big-file.csv')
+  ) TO 'output/dir/'
+  (FORMAT PARQUET, COMPRESSION zstd,
+   ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)
+")
+
+dbDisconnect(con, shutdown = TRUE)
 ```
 
-Two things to get right:
+Five details worth knowing:
 
-1.  **`max_rows_per_file = 5e6`** splits the output into multiple parquet files. This matters because DuckDB and arrow both parallelise reads across files, and smaller files mean better row-group pruning. One giant parquet file is almost as bad as one giant CSV.
-2.  **`existing_data_behavior = "overwrite"`** — note it is `"overwrite"`, not `"overwrite_or_ignore"`. That second form does not exist in current arrow and you'll get a cryptic `'arg' should be one of...` error.
+1.  **`read_csv_auto()`** is streaming. DuckDB never materialises the whole CSV in memory.
+2.  **`COMPRESSION zstd`** is worth setting explicitly — it shaves a meaningful fraction off the output (e.g. 1.82 GB → 1.22 GB on one of our reference tables).
+3.  **`ROW_GROUP_SIZE 250000`** is the right middle ground. Tiny row groups (10k) make full scans multiples slower.
+4.  **`ROW_GROUPS_PER_FILE 20`** gives about 5 million rows per output file. Many medium‑sized files parallelise far better than one enormous one.
+5.  **`preserve_insertion_order = false`** is a DuckDB pragma worth flipping for bulk export where row order does not matter.
 
 ::: {.callout-tip}
 ## How the streaming works
-`open_csv_dataset()` does not read the file. It returns a lazy handle. When `write_dataset()` starts pulling from it, arrow reads the CSV in small batches (a few hundred thousand rows at a time) and writes each batch straight to parquet. The whole 44.5 GB file passes through about 2 GB of RAM. We measured this in the [conversion benchmarks](02-csv-to-parquet.qmd): peak RSS stays flat regardless of input size.
+DuckDB's CSV reader operates on batches of rows, pushes them through any `SELECT` projection, and streams each batch straight to the parquet writer. A 44.5 GB input passes through about 2–3 GB of RAM; the memory budget does not grow with the file. The full measurement is in [A1](A1-reading-storing-benchmarks.qmd#per-file-conversion-log): peak RSS stays flat regardless of input size.
 :::
 
 Do this for each dataset you need. It is boring but fast, and you only do it once.
 
 ## Step 3: Build a DuckDB database
 
-With the parquet files in place, you now have a choice. You can query the parquet directly (with either arrow or DuckDB views), or you can load the parquet into a materialised DuckDB database. We tested both on the [DuckDB page](03-duckdb.qmd) and in the [benchmarks](04-benchmarks.qmd), and the answer is clear: materialise if you are going to query the data more than a couple of times.
+With the parquet files in place, you now have a choice. You can query the parquet directly (with either arrow or DuckDB views), or you can load the parquet into a materialised DuckDB database. We tested both in [Reading and storing](01-reading-storing.qmd#step-3-load-the-parquet-into-duckdb) and in the [join benchmarks](A3-join-benchmarks.qmd#t3-three-table-join), and the answer is clear: materialise if you are going to query the data more than a couple of times.
 
 ```r
 library(duckdb); library(DBI)
@@ -103,11 +107,11 @@ dbExecute(con, "
 ")
 ```
 
-Notice the `ORDER BY` on the MBS table. We showed in the [storage layout](04b-storage-layout.qmd) experiments that sorting a fact table by its join key makes point lookups 47× faster. It costs a couple of extra minutes at build time and pays off on every subsequent query that filters by the join key.
+Notice the `ORDER BY` on the MBS table. We showed in the [storage-variant experiments](A3-join-benchmarks.qmd#storage-variants) that sorting a fact table by its join key makes point lookups 47× faster. It costs a couple of extra minutes at build time and pays off on every subsequent query that filters by the join key.
 
 ::: {.callout-note}
 ## When sorting helps (and when it doesn't)
-Sorting by the join key is a big win for **point lookups** (looking up one person's data: 47× faster) and a modest help for **narrow filtered joins** when the filter correlates with the key. It does _not_ help full-table-scan joins where you touch every row anyway — see the [storage layout experiments](04b-storage-layout.qmd) for the honest numbers.
+Sorting by the join key is a big win for **point lookups** (looking up one person's data: 47× faster) and a modest help for **narrow filtered joins** when the filter correlates with the key. It does _not_ help full-table-scan joins where you touch every row anyway — see the [storage-variant experiments](A3-join-benchmarks.qmd#storage-variants) for the honest numbers.
 :::
 
 If you also want faster joins across the board, add a hashed integer key at ingest time:
@@ -121,16 +125,11 @@ dbExecute(con, "
 ")
 ```
 
-Integer joins are [about 2× faster](04b-storage-layout.qmd) than string joins. Keep the original `SYNTHETIC_AEUID` for display; use the hash for joining.
+Integer joins are [about 2× faster](A3-join-benchmarks.qmd#integer-hash-key-variant) than string joins. Keep the original `SYNTHETIC_AEUID` for display; use the hash for joining.
 
 ## Step 4: Query with dbplyr
 
-Now you are in the pleasant part. Open a _read-only_ connection (so multiple R sessions can share it) and use dplyr verbs as usual.
-
-::: {.callout-note}
-## Why dbplyr here, not duckplyr?
-For single-table work (like [case study 1](cs01-earnings.qmd)), duckplyr reads parquet directly with no setup — that's the fastest path for groupbys and filters. But for multi-table joins at PLIDA scale (30M people × 372M MBS claims), duckplyr's in-memory engine runs out of memory on a 32 GB machine. dbplyr with a DBI connection to the materialised `.duckdb` file lets DuckDB page through its native storage efficiently. The rule: **duckplyr for single-table, dbplyr for joins.**
-:::
+Now you are in the pleasant part. Open a _read-only_ connection (so multiple R sessions can share it) and use dplyr verbs as usual. This is the same recipe [case study 1](cs01-earnings.qmd) and [case study 2](cs02-health-services.qmd) use.
 
 ```{r query}
 con <- dbConnect(
@@ -188,7 +187,7 @@ result |>
 
 | Step | What | Time | Memory |
 |------|------|------|--------|
-| Convert CSV → parquet | `open_csv_dataset() |> write_dataset()` | ~2-3 s/GB | <2 GB |
+| Convert CSV → parquet | DuckDB `COPY ... TO parquet` | ~1.5 s/GB | <3 GB |
 | Build DuckDB | `CREATE TABLE ... FROM read_parquet()` | ~2 min for 372M rows | ~10 GB peak |
 | Query + collect | dbplyr verbs → `collect()` | ~3-4 s for a 3-table join | ~2 GB |
 | Plot | ggplot2 on the small result | instant | trivial |
@@ -210,7 +209,7 @@ A few things that will bite you if you are not expecting them:
 
 **Not setting `memory_limit`.** DuckDB will cheerfully try to use all your RAM for a big sort or join. On a 32 GB machine, set `memory_limit = '20GB'` so the OS and R can breathe.
 
-**One enormous parquet file.** If you write 372 million rows to a single parquet file, DuckDB cannot parallelise the read and zonemaps are less useful. Use `max_rows_per_file = 5e6` during conversion.
+**One enormous parquet file.** If you write 372 million rows to a single parquet file, DuckDB cannot parallelise the read and zonemaps are less useful. Set `ROW_GROUPS_PER_FILE 20` (≈5 million rows per file) in the `COPY ... TO parquet` step.
 
 ```{r disconnect}
 #| include: false

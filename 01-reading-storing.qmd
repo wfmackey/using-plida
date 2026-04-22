@@ -1,0 +1,237 @@
+---
+title: "Reading and storing raw data"
+---
+
+```{r setup}
+#| include: false
+source("R/00-paths.R")
+suppressPackageStartupMessages({
+  library(dplyr); library(arrow); library(fs); library(knitr)
+})
+```
+
+Administrative microdata usually arrives as CSV, and the CSVs are always bigger than you want them to be. The first job is to get that data off the "CSV on disk" default and onto something faster, smaller, and typed. On PLIDA-style data the right answer is almost always the same: **convert to parquet with DuckDB, and load the parquet into a materialised DuckDB database.**
+
+This chapter walks through that recipe. The evidence for each claim is in [Appendix A1](A1-reading-storing-benchmarks.qmd); cross-references below point to the relevant experiment.
+
+::: {.callout-note}
+## The SQL bits on this page are one-off
+This is the only chapter where a couple of DuckDB-native DDL commands appear — the CSV → parquet `COPY` and the `CREATE TABLE` that ingests the parquet. Both are one-shot setup steps that have no dbplyr equivalent. You run them once; every analysis after that (chapters 2–4 and the case studies) is ordinary tidyverse R.
+:::
+
+## What the data looks like
+
+The [`fplida`](https://github.com/wfmackey/fplida) package generates a realistic simulated PLIDA corpus: a spine-based synthetic panel of individuals linked across ATO, DHDA, DSS, and other datasets, with cross-dataset consistency. We work against the 30 million person variant, which on disk is about 751 GB of CSV:
+
+```{r corpus-size}
+#| echo: false
+tibble::tribble(
+  ~dataset,        ~size_gb,
+  "dhda-mbs",      329,
+  "ato-stp",       242,
+  "ato-pit_itr",    31,
+  "ato-pit_ps",     20,
+  "ato-pit_ie",     17,
+  "ncver-tva",      14,
+  "ato-sae",        13,
+  "ha-travellers",  11,
+  "_system",        11,
+  "dhda-air",        9,
+  "others",         54
+) |>
+  kable(col.names = c("Dataset", "Size (GB)"))
+```
+
+A single one of these — the 2015 MBS claims file — is 44.5 GB on its own. That is the stress-test file we return to throughout the site.
+
+For the demonstration we restrict attention to five tables, chosen to mimic the join pattern you would use for a labour-market study of health shocks: demographics on the left, an income table and a services-use table on the right, linked via the PLIDA spine.
+
+```{r subset}
+#| echo: false
+tibble::tribble(
+  ~label,        ~source,                                                        ~purpose,                                                  ~rows,
+  "demo",        "abs-core/plidage-core-demog-cb-c21-2006-latest.csv",           "birth year, gender, country of birth — keyed by SPINE_ID", "30M",
+  "abs_spine",   "abs-core/abs-spine.csv",                                       "spine_id → ABS SYNTHETIC_AEUID",                           "30M",
+  "ato_spine",   "ato-pit_itr/ato-spine.csv",                                    "spine_id → ATO SYNTHETIC_AEUID",                           "30M",
+  "dhda_spine",  "dhda-mbs/dhda-spine.csv",                                      "spine_id → DHDA SYNTHETIC_AEUID",                          "30M",
+  "itr",         "ato-pit_itr/madip-ge-*atoitrcontext*.csv",                     "income year, occupation code, residency — by ATO aeuid",   "170M",
+  "mbs",         "dhda-mbs/madipge-mbs-d-claims-2015.csv",                       "MBS claims for 2015 — by DHDA aeuid",                      "372M"
+) |>
+  kable()
+```
+
+The spine files are the PLIDA-specific glue. Each dataset provider (ABS, ATO, DHDA) has its own person identifier (`SYNTHETIC_AEUID`), and the `*-spine.csv` tables map each provider's identifier back to a common `spine_id`. The canonical question — _"how many MBS services per person by sex and age, for people born 1960–1970?"_ — is therefore a three-table join through the spine:
+
+```
+demo[SPINE_ID]
+  ⟕ dhda_spine[spine_id, SYNTHETIC_AEUID]
+  ⟕ mbs[SYNTHETIC_AEUID, NUMSERV, BENPAID]
+```
+
+This shape of question appears so often in PLIDA work that most of the case studies and benchmarks on this site are variations of it.
+
+## Step 1 — CSV to parquet, using DuckDB
+
+CSV should essentially always become parquet before serious work begins:
+
+- **Schema.** CSV has no types. Every read guesses or is handed a schema. Parquet stores the schema with the file.
+- **Columnar I/O.** PLIDA-style tables have dozens of columns; most queries touch a handful. Parquet lets the reader fetch only those columns.
+- **Compression.** Parquet compresses hard; explicit `zstd` is worth asking for. The 44.5 GB MBS 2015 file shrinks to 18.7 GB.
+- **Row groups and zonemaps.** Parquet stores min/max statistics per row group. A filter on `INCM_YR = 2014` prunes entire row groups whose `INCM_YR` range does not overlap 2014.
+- **Interop.** Every engine we care about — arrow, duckdb, polars, pandas, pyarrow — reads parquet natively. CSV has a thousand dialects.
+
+The only reason _not_ to convert is if the file is too small to bother, and in that case the conversion is free anyway.
+
+The recommended converter is DuckDB's CSV reader piped into `COPY ... TO ... (FORMAT PARQUET)`:
+
+```r
+library(duckdb); library(DBI)
+
+con <- dbConnect(duckdb::duckdb())
+dbExecute(con, "SET threads TO 8")
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET preserve_insertion_order = false")
+
+dbExecute(con, "
+  COPY (
+    SELECT * FROM read_csv_auto('dhda-mbs/madipge-mbs-d-claims-2015.csv')
+  ) TO '/offline/using-plida-data/parquet/dhda-mbs'
+  (FORMAT PARQUET, COMPRESSION zstd,
+   ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)
+")
+```
+
+Five details in that snippet are worth spelling out:
+
+1.  **`read_csv_auto()`** is a streaming bulk reader. DuckDB does not materialise the whole CSV first.
+2.  **`COMPRESSION zstd`** is worth setting explicitly. Default compression is weaker; on the `itr_context` table, explicit zstd cut the footprint from 1.82 GB to 1.22 GB.
+3.  **`ROW_GROUP_SIZE 250000`** is the middle ground: big enough to compress and skip efficiently, small enough to avoid a metadata explosion. Tiny row groups (10k) are actively harmful.
+4.  **`ROW_GROUPS_PER_FILE 20`** gives about five million rows per output file. Many medium-sized files parallelise better than one enormous one.
+5.  **`preserve_insertion_order = false`** unlocks a modest speed-up on bulk conversions where output row order is irrelevant.
+
+On the six large-file benchmark (three 48–51 GB MBS files plus three 48 GB STP files), DuckDB averaged `67.3s` per file against Arrow's `130.0s` — roughly a 2× speed-up — while writing slightly smaller parquet. Peak memory stayed under 3 GB in both cases. Full numbers in [A1 §Arrow vs DuckDB](A1-reading-storing-benchmarks.qmd#arrow-vs-duckdb-on-csv-to-parquet).
+
+::: {.callout-tip}
+## Why not Arrow?
+Arrow was the obvious first choice — `open_csv_dataset()` plus `write_dataset()` is the natural R-native streaming path, and it works. The benchmark just shows that DuckDB is faster at this specific step on this corpus. Arrow is still useful as a low-overhead _query_ layer over parquet; see the [data manipulation](02-data-manipulation.qmd) chapter.
+:::
+
+::: {.callout-note}
+## Should we skip parquet and ingest CSV straight into DuckDB?
+DuckDB can create a table directly from a CSV with `CREATE TABLE x AS SELECT * FROM read_csv_auto(...)`, so in principle you could skip the parquet intermediate. Don't, for three reasons:
+
+- Parquet is a useful artefact on its own — other tools read it without a DuckDB connection.
+- CSV-to-DuckDB-table takes about the same time as CSV-to-parquet plus parquet-to-DuckDB-table, and you end up with only the DuckDB copy.
+- If the DuckDB file ever corrupts or needs resharding, parquet gives you a cheap rebuild.
+:::
+
+## Step 2 — Get the parquet layout right
+
+Parquet is not one format. It is a family of layouts, and layout matters. Three rules from the focused layout benchmark on `itr_context` (evidence in [A1 §Layout](A1-reading-storing-benchmarks.qmd#parquet-layout-variants)):
+
+- **Use explicit zstd.** Current project-default compression left the file at 1.82 GB; explicit `zstd + 250k` row groups rewrote it at 1.22 GB on the same data.
+- **Only partition on columns you actually filter on.** Year partitioning helped year-filter queries on the multi-year `itr_context` table (DuckDB went from `0.080s` to `0.028s`). It is pointless to partition a single-year fact table like MBS 2015.
+- **Keep row groups medium-sized.** The 10k-row-group variant made the full groupby _much_ slower (Arrow `0.149s` → `0.515s`; DuckDB `0.100s` → `0.235s`).
+
+For fact tables you routinely do **point lookups** on — "all MBS claims for this person" — there is a further win available: **sort by the join key at ingest time.** On an unsorted 371 M-row MBS table every row group's `[min, max]` of `SYNTHETIC_AEUID` covers the full key space, so DuckDB's zonemap pruning cannot skip anything and the query scans the whole table. Sorting once at ingest time lets a single-value filter prune all but one row group, giving a roughly **47× speed-up** on point lookups at no query-side cost. Evidence in [A3 §Point lookup](A3-join-benchmarks.qmd#point-lookup-by-aeuid).
+
+The catch: **sorting only helps when the filter produces a contiguous range of the sorted column.** A demographic filter like "people born in 1970" is statistically independent of the AEUID, so sorting by AEUID gives no benefit on a three-way join filtered on `year_of_birth`. Sort for point lookups; do not sort for broad analytical queries.
+
+## Step 3 — Load the parquet into DuckDB
+
+Once the parquet files exist there are two natural ways to make them available to DuckDB.
+
+### Views over parquet (zero copy)
+
+```r
+con <- dbConnect(duckdb::duckdb(), dbdir = "plida_views.duckdb")
+dbExecute(con, "
+  CREATE OR REPLACE VIEW mbs AS
+  SELECT * FROM read_parquet('/offline/.../dhda-mbs/*.parquet')
+")
+```
+
+Nothing is copied. DuckDB builds a view that points at the parquet glob and re-reads on every query. Build cost is effectively zero. Every query pays the parquet decode cost, but DuckDB pushes filters and projections down, so well-predicated queries are cheap.
+
+### Materialised tables (ingest once, query forever)
+
+```r
+con <- dbConnect(duckdb::duckdb(), dbdir = "plida_tables.duckdb")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE mbs AS
+  SELECT * FROM read_parquet('/offline/.../dhda-mbs/*.parquet')
+")
+```
+
+The parquet is read once and written into DuckDB's own columnar storage. Subsequent queries never touch parquet. Build cost is linear in input size; query cost is lower and more predictable.
+
+### When to pick which
+
+- **Single-table scans and groupbys**: views are already excellent. In the benchmark run the view was slightly faster than the table on T1 and T2, and the absolute difference was tiny.
+- **Join-heavy work**: tables pull away. On the 3-table MBS join (T3), the materialised table ran in `3.71s`; the view-over-parquet version took `6.39s`. See [A3 §T3](A3-join-benchmarks.qmd#t3-three-table-join).
+- **Repeated use**: if you rerun the same pipeline many times, the one-off ingest cost is amortised immediately. MBS takes about two minutes to ingest once; that is the first two minutes of your first five queries combined.
+
+The practical default: **tables for anything you run more than once, views for ad-hoc exploration.** Prefer views when the underlying parquet changes often, when disk is precious (tables duplicate storage), or when other non-DuckDB tools need to read the same files unchanged.
+
+## Step 4 — Set the right connection defaults
+
+Two knobs make the difference between a DuckDB connection that behaves and one that crashes the machine:
+
+```r
+con <- dbConnect(duckdb::duckdb(),
+                 dbdir = "plida_tables.duckdb",
+                 read_only = TRUE)
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET threads TO 8")
+```
+
+- **`memory_limit`** should be about 60 % of physical RAM. On a 32 GB machine, 20 GB leaves enough for R's own heap plus the OS. Without this, DuckDB will claim most of free memory and one of the two processes will be killed.
+- **`threads`** controls parallelism. For bulk ingest and scans, more is better up to core count; for small ad-hoc queries the default is already fine.
+- **`read_only = TRUE`** on an already-built database lets multiple sessions attach simultaneously. Useful when you iterate in one R session and render a Quarto document in another.
+
+## Putting the pipeline together
+
+The end-to-end recipe for a new PLIDA dataset:
+
+```r
+# 1. CSV → parquet (one-shot, outside the analysis)
+con <- dbConnect(duckdb::duckdb())
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "SET threads TO 8")
+dbExecute(con, "SET preserve_insertion_order = false")
+dbExecute(con, "
+  COPY (SELECT * FROM read_csv_auto('raw/*.csv'))
+  TO 'parquet/table'
+  (FORMAT PARQUET, COMPRESSION zstd,
+   ROW_GROUP_SIZE 250000, ROW_GROUPS_PER_FILE 20)
+")
+dbDisconnect(con, shutdown = TRUE)
+
+# 2. parquet → DuckDB database (one-shot)
+con <- dbConnect(duckdb::duckdb(), dbdir = "plida_tables.duckdb")
+dbExecute(con, "SET memory_limit = '20GB'")
+dbExecute(con, "CREATE TABLE mbs AS
+             SELECT * FROM read_parquet('parquet/table/*.parquet')")
+dbDisconnect(con, shutdown = TRUE)
+
+# 3. analysis (every day)
+library(dplyr); library(dbplyr)
+con <- dbConnect(duckdb::duckdb(),
+                 dbdir = "plida_tables.duckdb",
+                 read_only = TRUE)
+dbExecute(con, "SET memory_limit = '20GB'")
+
+tbl(con, "mbs") |>
+  filter(incm_yr == 2015L) |>
+  count(month = month(svcdate)) |>
+  collect()
+```
+
+Everything that follows in this book is a variation on step 3.
+
+## What lives in [A1](A1-reading-storing-benchmarks.qmd)
+
+- Arrow vs DuckDB on the six-file CSV → parquet benchmark (time, memory, output size).
+- Per-file conversion log across the corpus, and the scaling relationship with CSV size.
+- Parquet layout experiments: explicit zstd, partitioning, row-group size.
+- DuckDB build cost for materialised tables vs views.
