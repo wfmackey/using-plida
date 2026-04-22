@@ -150,9 +150,9 @@ y15_keys <- y15 |> pull(synthetic_aeuid)
 mgrs_14 |> filter(synthetic_aeuid %in% y15_keys) |> summarise(n = n())
 ```
 
-This is a landmine on large data. `pull()` (or the older `collect()$col` pattern) materialises the entire right-hand key column into an R vector. On a 10M-row `y15` that is already 160 MB; on a 372M-row MBS-keyed filter it breaks the machine. The `%in%` operator then ships that vector back to DuckDB as a literal list in the SQL — sometimes megabytes of `IN (...)` text — which is slow to parse and slow to execute.
+This is a landmine on large data. `pull()` pulls the entire right-hand key column into an R vector — for a 10M-row right side, that's already 160 MB; for a 372M-row one, it breaks the machine. And then `%in%` has to send that vector back to DuckDB inside the query, which is slow both to build and to run.
 
-`semi_join()` / `anti_join()` keep the whole operation inside the engine: DuckDB builds a hash table on the key column, probes the left side, and returns the filtered rows. No R vector is built, no SQL literal is shipped.
+`semi_join()` and `anti_join()` keep the whole operation inside DuckDB: the ID column on the right stays in the database, and DuckDB does the matching without anything coming back to R. No big R vector, no giant SQL literal.
 
 **Rule of thumb: if you find yourself writing `filter(x %in% (y |> pull(key)))`, it is a semi-join. Write the semi-join.**
 :::
@@ -177,9 +177,9 @@ spine_coverage
 
 In the synthetic fplida corpus every person is present in every spine, so the off-diagonals are zero. On real PLIDA, the off-diagonals tell you how much attrition each spine is hiding — the reason to write this join in the first place.
 
-## The habit that matters most: push filters before joins
+## The habit that matters most: filter before joining
 
-The single change that most reliably makes a slow join fast on a large table is moving `filter()` calls upstream of the `join()`.
+The single change that most reliably makes a slow join fast on a large table is moving `filter()` calls **before** the `join()`.
 
 ```r
 # DON'T
@@ -193,12 +193,12 @@ mbs_db |>
   inner_join(dhda_sp_db, by = "synthetic_aeuid")
 ```
 
-DuckDB's optimiser usually does this transformation for you — but not always, and Arrow's optimiser does not do it reliably at all. On Arrow, writing the filter after the join will often try to build a hash table on the entire 372M-row MBS table before applying the filter, which OOMs on a 32 GB machine. Writing the filter first lets the parquet reader prune row groups and only deliver the rows the join needs.
+Why the order matters: the first (DON'T) pipeline first tries to join every row of MBS (372 million of them) to the spine, and only then throws away the rows outside the date range. Under Arrow this usually runs out of memory. DuckDB will often rearrange the steps for you behind the scenes, but writing the filter first is safer: it means only the rows you actually want ever reach the join.
 
 Two corollaries:
 
-- **Select columns early.** If you only need `synthetic_aeuid` and `numserv` from MBS, say so before the join. Parquet is columnar, and DuckDB will read only the columns it needs — but only if you have told it which columns you need.
-- **Call `explain()` on anything slow.** If you cannot see the filter being pushed into the parquet scan in the plan, the filter is not being pushed. Rewrite.
+- **Select columns early.** If you only need `synthetic_aeuid` and `numserv` from MBS, say so before the join. Parquet only reads the columns you ask for, but only if the `select()` is upstream of everything else. Extra columns cost memory in the join.
+- **If something is slow, check the SQL with `show_query()`.** You will see whether your filter made it into the inner scan, or whether it got stuck outside the join.
 
 ## The PLIDA three-table join
 
@@ -238,23 +238,23 @@ big |>
   theme_minimal(base_size = 11)
 ```
 
-Three tables, the largest 372M rows, 20 GB of memory budget. On the T3 benchmark ([A3](A3-join-benchmarks.qmd#t3-three-table-join)) DuckDB tables finish in about **4 seconds**; Arrow's Acero engine is killed by the OS part-way through building its hash table, and `dplyr` / `data.table` cannot even attempt the problem because the MBS parquet is larger than RAM.
+Three tables, the largest 372M rows, a 20 GB memory budget. On the T3 benchmark ([A3](A3-join-benchmarks.qmd#t3-three-table-join)) DuckDB finishes this in about **4 seconds**. Arrow is killed by the operating system part-way through, because it needs to keep the whole join in memory at once. `dplyr` / `data.table` cannot attempt it at all because the MBS parquet is larger than RAM.
 
 ::: {.callout-important}
 ## The size rule for joins
-Arrow's Acero engine is fine for joins whose hash tables fit in RAM. DuckDB handles joins whose hash tables **do not** fit in RAM, because it spills to disk via its buffer pool. On a 32 GB machine, the cut-off falls somewhere around the 372M-row MBS join: Arrow cannot do it, DuckDB does it in seconds.
+Why does DuckDB manage where Arrow doesn't? The join needs to build a lookup structure that contains one side of the join. If that structure fits in RAM, Arrow is fine. If it doesn't, Arrow dies — it has no mechanism for spilling pieces of the lookup to disk. DuckDB does: when it runs low on memory, it writes some of the intermediate work to a scratch directory and continues. On a 32 GB machine, the MBS join (372M rows) is over the Arrow line and under the DuckDB line.
 
-**Default to DuckDB for any PLIDA join that involves a real fact table. Arrow is the secondary engine for joins between small-to-medium tables.**
+**Default to DuckDB for any PLIDA join that involves a real fact table. Arrow is fine for joins between small-to-medium tables.**
 :::
 
-## Speed tricks at the storage layer
+## Storage choices that affect join speed
 
-Two storage-layer choices affect join speed, but the gains depend on the query. Evidence in [A3 §Storage variants](A3-join-benchmarks.qmd#storage-variants).
+A couple of one-off choices about how the data is written change how fast the joins that use it are. All backed up by numbers in [A3](A3-join-benchmarks.qmd#storage-variants).
 
-- **Sorting a fact table by the join key helps point lookups dramatically.** On the 371M-row MBS table, sorting by `SYNTHETIC_AEUID` made a single-person point lookup about **47×** faster, because DuckDB's zonemap pruning could skip all but one row group.
-- **It does not help broad analytical joins.** A three-way join filtered on `year_of_birth` gets no benefit from sorting MBS by AEUID, because people born in 1970 are uniformly distributed across AEUIDs — the build-side range covers the whole key space, and no zonemap can prune it.
-- **Integer keys are about 1.9× faster than 12-character string keys.** If repeated string-key joins dominate a workload, a hashed-integer surrogate key is worth benchmarking — though keep the original string around, because the hash is not formally collision-free.
-- **`PRIMARY KEY` does not help query performance.** DuckDB's ART index maintained by `PRIMARY KEY` / `UNIQUE` is there for integrity, not speed. It slows ingest (~4×) and does not accelerate joins. Declare constraints for correctness, not performance.
+- **Sorting a fact table by the person-ID column helps single-person lookups a lot.** On the 371M-row MBS table, sorting by `SYNTHETIC_AEUID` made "give me everything for person X" about **47× faster**. This is the same trick as in [Reading and storing](01-reading-storing.qmd#the-one-sorting-trick-that-matters): once the data is sorted, the parquet reader can skip all the chunks that don't contain person X.
+- **Sorting does not help broad analytical joins.** A three-way join filtered on `year_of_birth` gets no benefit from sorting MBS by `synthetic_aeuid`, because people born in 1970 are spread uniformly across the whole range of IDs — there's no contiguous range of IDs to skip to. Sort for single-person lookups, not for group analyses.
+- **Integer join keys are about 1.9× faster than 12-character string keys.** If you are joining on `synthetic_aeuid` all day, creating a numeric version once at ingest (e.g. `hash(synthetic_aeuid)`) and joining on that is worth benchmarking. Keep the original string around — hashes are not guaranteed unique — but for the hot-path joins the integer version is faster.
+- **Declaring a `PRIMARY KEY` or `UNIQUE` constraint does not make joins faster.** It slows down the one-time ingest (roughly 4×) and gives you an integrity check at write-time — nothing more. Use constraints if you want DuckDB to guarantee no duplicates, not for query speed.
 
 ## A quick recipe card
 

@@ -46,9 +46,9 @@ Once the data is in parquet and DuckDB, the day-to-day work is ordinary `dplyr`:
 
 This chapter covers the everyday verbs, the small translation traps that bite once, and the escape hatches for the things dplyr does not cover. Joins and window functions get their own chapters. The evidence behind the speed and memory claims is in [Appendix A2](A2-data-manipulation-benchmarks.qmd).
 
-## The mental model: lazy query, eager `collect()`
+## The mental model: build the pipe, then `collect()` at the end
 
-`tbl(con, "name")` returns a **lazy** dbplyr table. Every verb you apply extends a SQL query plan. Nothing runs until you call `collect()` (pulls the result into R as a tibble) or `compute()` (materialises into a temporary DuckDB table). The same pattern applies to Arrow — `open_dataset()` returns a lazy `arrow_dplyr_query`.
+`tbl(con, "name")` returns a **lazy** handle to a DuckDB table. "Lazy" means nothing actually runs when you apply a verb — each verb just adds a step to a pipeline description that DuckDB will run later. The actual work only happens when you call `collect()`, which executes the whole pipeline and pulls the result back into R as a tibble. (There is also `compute()`, which runs the pipeline but leaves the result inside DuckDB as a table.) The same pattern applies to Arrow: `open_dataset()` returns a lazy object that you build up with verbs and `collect()` at the end.
 
 ```{r read-duckdb}
 # rename_with(tolower) lowercases SCREAMING_CASE columns so the rest of the
@@ -59,10 +59,10 @@ ato_sp_db  <- tbl(con, "ato_spine")  |> rename_with(tolower)
 dhda_sp_db <- tbl(con, "dhda_spine") |> rename_with(tolower)
 ```
 
-Two golden rules for getting this right:
+Two key rules for getting this right:
 
-- **Keep the pipe lazy until the last step.** Every `collect()` in the middle of a pipeline forces DuckDB to run its plan and hand the result to R, where every subsequent verb runs in-memory without pushdown. Save `collect()` for the final, small object.
-- **Make the last step small.** A `collect()` on a billion-row query is a segfault waiting to happen. Aggregate, filter, or `slice_head()` first.
+- **Keep the pipe lazy until the last step.** A `collect()` in the middle of a pipeline forces the work so far back into R memory, and every verb after it runs in R rather than in DuckDB. You lose the speed advantage. Save `collect()` for the final, small result.
+- **Make the last step small.** A `collect()` that tries to pull billions of rows into R will crash your session. Aggregate or `slice_head()` first.
 
 Two useful diagnostics on a lazy object:
 
@@ -70,15 +70,12 @@ Two useful diagnostics on a lazy object:
 glimpse(itr_db)
 ```
 
-```r
-# See the SQL dbplyr will send
+```{r show_query}
+# See the SQL that dbplyr would send to DuckDB
 itr_db |> filter(incm_yr == 2015L) |> count(ocptn_grp_cd) |> show_query()
-
-# Check the DuckDB query plan, including which filters are pushed down
-itr_db |> filter(incm_yr == 2015L) |> count(ocptn_grp_cd) |> explain()
 ```
 
-`show_query()` prints the SQL; `explain()` prints the DuckDB optimiser plan. If a filter is not appearing at the leaf scan, the optimiser has not pushed it down — which usually means rewriting the pipe (see the join-ordering warning in the [joins chapter](03-joins.qmd)).
+`show_query()` prints the SQL — handy for sanity-checking what DuckDB is being asked to do, and for spotting the occasional translation surprise.
 
 ## Filter and count: a single year of ITR
 
@@ -94,9 +91,9 @@ itr_db |>
   arrange(occ_major)
 ```
 
-A fraction of a second. DuckDB pushes the `incm_yr == 2015L` predicate down to the row-group zonemap on the parquet reader (or the native storage, for a materialised table), so only rows for 2015 ever hit the engine. Peak memory stays flat: `dplyr-on-tibbles` would have paid ~250 MB to hold the whole year in RAM first.
+A fraction of a second. DuckDB uses the per-row-group min/max summaries we described in [Reading and storing](01-reading-storing.qmd#step-1-csv-to-parquet-using-duckdb) to skip every row-group that doesn't contain any 2015 rows, so only 2015 rows are actually decoded. Memory stays flat: ordinary dplyr on a tibble would have paid around 250 MB to hold the whole year of data before doing anything with it.
 
-The T1 benchmark in [A2](A2-data-manipulation-benchmarks.qmd#t1-filter-and-count) shows this explicitly — DuckDB and Arrow both finish in well under a second while `dplyr`-on-tibbles takes 4+ seconds and materialises the year in memory.
+The T1 benchmark in [A2](A2-data-manipulation-benchmarks.qmd#t1-filter-and-count) shows this explicitly — DuckDB and Arrow both finish in well under a second while `dplyr`-on-tibbles takes 4+ seconds and loads the whole year into R memory first.
 
 ## Groupby across all years
 
@@ -135,9 +132,9 @@ occ_by_year_db |>
 
 The T2 benchmark ([A2 §T2](A2-data-manipulation-benchmarks.qmd#t2-groupby-across-all-years)) is where the regime changes become visible. `dplyr` on tibbles takes about 35 seconds and 14.5 GB of RAM — it has to load every row before grouping. DuckDB and Arrow both stream the scan and hold only the result (~1000 rows). That is roughly a 200× speed-up and a 50× memory reduction, on identical dplyr code, for changing one thing: what `tbl` points at.
 
-## `mutate()`: watch the backend translation
+## `mutate()`: watch for small translation differences
 
-`mutate()` is where the translators start to differ. Anything beyond simple arithmetic or string concatenation maps onto each engine's kernel catalogue, and the mapping is rarely identical. The innocuous expression "round a year down to the nearest decade" is the textbook trap.
+`mutate()` is where small differences between backends appear. Your dplyr code is being translated — into DuckDB's SQL on one side, or into Arrow's equivalent function on the other — and the translations don't always agree on the fine detail. For the everyday operations (`x + 1`, `paste0`, `case_when`, `is.na`) everything is fine. The innocuous-looking expression "round a year down to the nearest decade" is the textbook trap.
 
 ```{r mutate-duckdb}
 #| time_it: "mutate + arrange (30M)"
@@ -186,10 +183,10 @@ And a few that routinely need help:
 
 ## When the translation fails
 
-You find out at `collect()` time: a query that looks valid raises a dbplyr translation error (or an Acero error under Arrow). The right response, in order of preference:
+You find out at `collect()` time: a dbplyr translation error (or, under Arrow, a "function not implemented" error). The right response, in order of preference:
 
-1.  **Rewrite using primitives the engine supports.** The `floor()` example above. `stringr::str_c()` instead of `paste0()`. `coalesce()` instead of `ifelse()` for NULL handling. This covers almost every case you will meet.
-2.  **Last resort: drop a `sql()` fragment into a single `mutate()` or `filter()`.** This keeps the pipe in tidyverse but hands DuckDB one literal expression where there is no tidy alternative:
+1.  **Rewrite using something the translator already knows.** The `floor()` example above. `stringr::str_c()` instead of `paste0()`. `coalesce()` instead of `ifelse()` when you're handling missing values. This covers almost every case you will meet.
+2.  **Last resort: drop a `sql()` fragment into a single `mutate()` or `filter()`.** This keeps the pipe in tidyverse but hands DuckDB one literal SQL expression where there is no tidy alternative:
 
     ```r
     demo_db |>
@@ -197,17 +194,17 @@ You find out at `collect()` time: a query that looks valid raises a dbplyr trans
       count(age_bucket)
     ```
 
-    Reserve this for the genuinely irreducible DuckDB-specific features — `QUALIFY`, rare aggregates, custom rollups. **If you find yourself writing more than one `sql(...)` per pipeline, rewrite the tidyverse side instead.**
+    Reserve this for genuinely DuckDB-specific features that have no dplyr counterpart. **If you find yourself writing more than one `sql(...)` per pipeline, rewrite the tidyverse side instead.**
 
-You should almost never reach for `dbGetQuery()` with a hand-written SQL string. Writing an entire query in raw SQL means you lose the lazy composition, the auto-tested translation, and the reader-familiar tidyverse syntax. It is reserved for DDL (creating tables once at ingest) and for the small set of operations that have no dbplyr equivalent at all.
+You should almost never reach for `dbGetQuery()` (running a hand-written SQL query in one shot). Writing an entire query as a SQL string means giving up lazy composition, the familiar dplyr syntax, and the automatic translation we rely on everywhere else in the book.
 
 ## Arrow as a secondary engine
 
-Arrow gives you the same dplyr surface over parquet _without_ a DuckDB connection. It is a legitimate alternative when:
+`arrow` gives you the same dplyr verbs over parquet without needing a DuckDB database. It is a reasonable alternative in a few specific situations:
 
-- You want to query parquet files in a directory without standing up a DuckDB database.
-- You are doing a linear read → filter → project → aggregate → write pipeline.
-- You need interop with Python / polars / pyarrow.
+- You are looking at someone else's parquet folder and do not want to stand up a DuckDB database just to explore it.
+- You are doing a simple "read, filter, aggregate, save" pipeline with no joins or window functions.
+- You want the output to be read seamlessly by Python tools that prefer the Arrow format.
 
 ```{r read-arrow}
 itr_ar <- open_dataset(file.path(pq, "itr_context")) |> rename_with(tolower)
@@ -219,7 +216,7 @@ itr_ar |>
   head()
 ```
 
-For scans and simple groupbys Arrow and DuckDB are indistinguishable (see the walkthrough timings in [A2](A2-data-manipulation-benchmarks.qmd#walkthrough-timings)). The gap opens on joins and window functions — covered in the [joins](03-joins.qmd) and [window functions](04-window-functions.qmd) chapters respectively — and that is where DuckDB becomes the safe default.
+For scans and simple groupbys Arrow and DuckDB are indistinguishable (see the walkthrough timings in [A2](A2-data-manipulation-benchmarks.qmd#walkthrough-timings)). The gap opens on joins and window functions — covered in the [joins](03-joins.qmd) and [window functions](04-window-functions.qmd) chapters — and that is where DuckDB becomes the safe default.
 
 ## Small result, large source: the whole point
 

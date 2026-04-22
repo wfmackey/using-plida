@@ -72,15 +72,16 @@ This shape of question appears so often in PLIDA work that most of the case stud
 
 ## Step 1 — CSV to parquet, using DuckDB
 
-CSV should essentially always become parquet before serious work begins:
+CSV should essentially always become parquet before serious work begins. Four plain reasons:
 
-- **Schema.** CSV has no types. Every read guesses or is handed a schema. Parquet stores the schema with the file.
-- **Columnar I/O.** PLIDA-style tables have dozens of columns; most queries touch a handful. Parquet lets the reader fetch only those columns.
-- **Compression.** Parquet compresses hard; explicit `zstd` is worth asking for. The 44.5 GB MBS 2015 file shrinks to 18.7 GB.
-- **Row groups and zonemaps.** Parquet stores min/max statistics per row group. A filter on `INCM_YR = 2014` prunes entire row groups whose `INCM_YR` range does not overlap 2014.
-- **Interop.** Every engine we care about — arrow, duckdb, polars, pandas, pyarrow — reads parquet natively. CSV has a thousand dialects.
+- **Parquet knows the column types; CSV doesn't.** In a CSV, every column is a string until something reads it and guesses. `year_of_birth` might be read as a number in one session and a character in the next. Parquet files record the type of each column once, at write time, and every tool that reads them agrees.
+- **Parquet lets you read one column at a time.** PLIDA tables have dozens of columns and most queries touch a handful. A CSV read always reads every column of every row. Parquet is arranged so that the reader can fetch only the columns the query actually uses. This is the single biggest reason these pipelines are fast.
+- **Parquet files are much smaller.** Parquet compresses each column separately, and we ask it to use the strong `zstd` algorithm. The 44.5 GB MBS 2015 CSV becomes 18.7 GB of parquet. Smaller files move through memory and disk faster.
+- **Parquet stores mini-summaries that let readers skip chunks.** A parquet file is internally split into groups of rows (a few hundred thousand at a time). For each group, the file records the min and max of every column. When you ask for `filter(incm_yr == 2014)`, the reader looks at those min/max summaries and skips any group whose year range doesn't include 2014 — without decompressing or reading the rows. This is the other reason queries that look at a sliver of the data are fast.
 
-The only reason _not_ to convert is if the file is too small to bother, and in that case the conversion is free anyway.
+Parquet is also the format everyone uses. `arrow`, `duckdb`, Python's `pandas`, `polars`, pretty much anything — all read parquet natively. CSV has a thousand dialects.
+
+The only reason _not_ to convert is if the file is small enough that you never cared about speed anyway.
 
 The recommended converter is DuckDB's CSV reader piped into `COPY ... TO ... (FORMAT PARQUET)`:
 
@@ -103,11 +104,11 @@ dbExecute(con, "
 
 Five details in that snippet are worth spelling out:
 
-1.  **`read_csv_auto()`** is a streaming bulk reader. DuckDB does not materialise the whole CSV first.
-2.  **`COMPRESSION zstd`** is worth setting explicitly. Default compression is weaker; on the `itr_context` table, explicit zstd cut the footprint from 1.82 GB to 1.22 GB.
-3.  **`ROW_GROUP_SIZE 250000`** is the middle ground: big enough to compress and skip efficiently, small enough to avoid a metadata explosion. Tiny row groups (10k) are actively harmful.
-4.  **`ROW_GROUPS_PER_FILE 20`** gives about five million rows per output file. Many medium-sized files parallelise better than one enormous one.
-5.  **`preserve_insertion_order = false`** unlocks a modest speed-up on bulk conversions where output row order is irrelevant.
+1.  **`read_csv_auto()` reads in chunks.** It doesn't load the whole CSV into memory first. A 44 GB file passes through a memory footprint of a few GB while being written to parquet.
+2.  **`COMPRESSION zstd`** is worth setting explicitly. The default compression is weaker. On the `itr_context` table, explicit zstd cut the parquet size from 1.82 GB to 1.22 GB.
+3.  **`ROW_GROUP_SIZE 250000`** sets the size of the row-groups we described above (the internal chunks of the parquet file, with their min/max summaries). 250,000 rows per group is a sensible middle ground: big enough that compression and chunk-skipping work well, small enough that the parquet metadata doesn't balloon. Very small groups (say, 10,000) slow queries down noticeably.
+4.  **`ROW_GROUPS_PER_FILE 20`** gives about five million rows per output file. Reading a few medium files in parallel is faster than reading one enormous file. Think of it like splitting a long CSV into shards so multiple CPU cores can work at once.
+5.  **`preserve_insertion_order = false`** unlocks a modest speed-up on bulk conversions where we do not care about the order of rows in the output.
 
 On the six large-file benchmark (three 48–51 GB MBS files plus three 48 GB STP files), DuckDB averaged `67.3s` per file against Arrow's `130.0s` — roughly a 2× speed-up — while writing slightly smaller parquet. Peak memory stayed under 3 GB in both cases. Full numbers in [A1 §Arrow vs DuckDB](A1-reading-storing-benchmarks.qmd#arrow-vs-duckdb-on-csv-to-parquet).
 
@@ -127,21 +128,25 @@ DuckDB can create a table directly from a CSV with `CREATE TABLE x AS SELECT * F
 
 ## Step 2 — Get the parquet layout right
 
-Parquet is not one format. It is a family of layouts, and layout matters. Three rules from the focused layout benchmark on `itr_context` (evidence in [A1 §Layout](A1-reading-storing-benchmarks.qmd#parquet-layout-variants)):
+Parquet is not one format. How you write the file — the compression, the row-group size, whether you split the output into folders by year — changes how fast the reader can scan it. Three rules, all backed up in [A1](A1-reading-storing-benchmarks.qmd#parquet-layout-variants):
 
-- **Use explicit zstd.** Current project-default compression left the file at 1.82 GB; explicit `zstd + 250k` row groups rewrote it at 1.22 GB on the same data.
-- **Only partition on columns you actually filter on.** Year partitioning helped year-filter queries on the multi-year `itr_context` table (DuckDB went from `0.080s` to `0.028s`). It is pointless to partition a single-year fact table like MBS 2015.
-- **Keep row groups medium-sized.** The 10k-row-group variant made the full groupby _much_ slower (Arrow `0.149s` → `0.515s`; DuckDB `0.100s` → `0.235s`).
+- **Use explicit zstd.** The project-default compression left the file at 1.82 GB; explicit `zstd + 250k` row groups rewrote the same data at 1.22 GB.
+- **Partitioning is folder-based splitting.** Parquet lets you split a table into a folder of files by the value of one column, e.g. `by_year/year=2014/`, `by_year/year=2015/`, etc. A filter on `year == 2014` then touches only the files in that subfolder, regardless of what's inside. It's worth doing when you routinely filter on that column, and pointless otherwise. For a multi-year table like `itr_context`, year-partitioning made `filter(incm_yr == 2015)` run in `0.028s` vs `0.080s`. For MBS 2015 — which is already one year — there is nothing to gain.
+- **Keep row groups medium-sized.** Tiny row groups (10,000 rows) slow full-table scans down noticeably — a `summarise` over the whole table went from `0.10s` to `0.24s`. The middle ground (250,000 rows) is usually right.
 
-For fact tables you routinely do **point lookups** on — "all MBS claims for this person" — there is a further win available: **sort by the join key at ingest time.** On an unsorted 371 M-row MBS table every row group's `[min, max]` of `SYNTHETIC_AEUID` covers the full key space, so DuckDB's zonemap pruning cannot skip anything and the query scans the whole table. Sorting once at ingest time lets a single-value filter prune all but one row group, giving a roughly **47× speed-up** on point lookups at no query-side cost. Evidence in [A3 §Point lookup](A3-join-benchmarks.qmd#point-lookup-by-aeuid).
+### The one sorting trick that matters
 
-The catch: **sorting only helps when the filter produces a contiguous range of the sorted column.** A demographic filter like "people born in 1970" is statistically independent of the AEUID, so sorting by AEUID gives no benefit on a three-way join filtered on `year_of_birth`. Sort for point lookups; do not sort for broad analytical queries.
+For big tables you look up one person at a time — "give me every MBS claim for person X" — you can get a huge speed-up by **sorting the table by the person ID at write time**. Here's why it matters, in the same language as the row-group explanation above:
+
+Parquet stores a min and max of every column for every row-group. When the data is unsorted, every row-group's range of `synthetic_aeuid` covers basically the whole ID space, so a filter like `synthetic_aeuid == "X"` can't skip any row-group — the reader has to open all of them. When the data is sorted by `synthetic_aeuid`, each row-group holds a tight range of IDs, and the reader can skip every row-group except the one containing "X". On the 371-million-row MBS table this is about **47× faster** for single-person lookups (see [A3](A3-join-benchmarks.qmd#point-lookup-by-aeuid)).
+
+The catch: **sorting only helps when the filter produces a contiguous range of the sorted column.** "People born in 1970" are uniformly spread across the whole range of person IDs (`year_of_birth` has nothing to do with how IDs were assigned), so sorting MBS by `synthetic_aeuid` does nothing to speed up a three-way join filtered on `year_of_birth`. Sort for single-person lookups; do not sort for broad analytical queries.
 
 ## Step 3 — Load the parquet into DuckDB
 
 Once the parquet files exist there are two natural ways to make them available to DuckDB.
 
-### Views over parquet (zero copy)
+### Option A — "views" over parquet (zero copy)
 
 ```r
 con <- dbConnect(duckdb::duckdb(), dbdir = "plida_views.duckdb")
@@ -151,9 +156,9 @@ dbExecute(con, "
 ")
 ```
 
-Nothing is copied. DuckDB builds a view that points at the parquet glob and re-reads on every query. Build cost is effectively zero. Every query pays the parquet decode cost, but DuckDB pushes filters and projections down, so well-predicated queries are cheap.
+A **view** is a name you give to a query. Here you are telling DuckDB: "whenever anyone asks for the table `mbs`, go read these parquet files." The parquet is not copied anywhere. Setting this up takes milliseconds. Every query then does its own parquet read, but only of the columns and row-groups it needs — which is fast.
 
-### Materialised tables (ingest once, query forever)
+### Option B — "materialised tables" (copy the parquet into DuckDB once)
 
 ```r
 con <- dbConnect(duckdb::duckdb(), dbdir = "plida_tables.duckdb")
@@ -163,15 +168,15 @@ dbExecute(con, "
 ")
 ```
 
-The parquet is read once and written into DuckDB's own columnar storage. Subsequent queries never touch parquet. Build cost is linear in input size; query cost is lower and more predictable.
+Here DuckDB reads the parquet once and writes the data into its own internal storage inside the `.duckdb` file. After this one-off ingest, queries against the `mbs` table never touch the parquet again. Building the table takes minutes for a large fact table like MBS; subsequent queries are a bit faster and more predictable, because DuckDB owns the storage and doesn't have to translate from parquet each time.
 
 ### When to pick which
 
-- **Single-table scans and groupbys**: views are already excellent. In the benchmark run the view was slightly faster than the table on T1 and T2, and the absolute difference was tiny.
-- **Join-heavy work**: tables pull away. On the 3-table MBS join (T3), the materialised table ran in `3.71s`; the view-over-parquet version took `6.39s`. See [A3 §T3](A3-join-benchmarks.qmd#t3-three-table-join).
-- **Repeated use**: if you rerun the same pipeline many times, the one-off ingest cost is amortised immediately. MBS takes about two minutes to ingest once; that is the first two minutes of your first five queries combined.
+- **Single-table `filter` + `summarise`**: views are fine. On the benchmark tasks T1 and T2 the view was actually slightly faster than the table and the difference was tiny.
+- **Joins across big tables**: tables pull away. On the three-way MBS join (T3), the materialised table finished in `3.7s`; the view version took `6.4s`. See [A3](A3-join-benchmarks.qmd#t3-three-table-join).
+- **Running the same pipeline many times**: pay the two-minute ingest cost once and then every run is a bit faster. If you are going to run this pipeline more than a couple of times, tables win.
 
-The practical default: **tables for anything you run more than once, views for ad-hoc exploration.** Prefer views when the underlying parquet changes often, when disk is precious (tables duplicate storage), or when other non-DuckDB tools need to read the same files unchanged.
+The practical default: **tables for anything you run more than once, views for ad-hoc exploration.** Prefer views when the underlying parquet changes often, when disk is tight (tables duplicate the storage), or when other tools need to read the same files.
 
 ## Step 4 — Set the right connection defaults
 
@@ -185,7 +190,7 @@ dbExecute(con, "SET memory_limit = '20GB'")
 dbExecute(con, "SET threads TO 8")
 ```
 
-- **`memory_limit`** should be about 60 % of physical RAM. On a 32 GB machine, 20 GB leaves enough for R's own heap plus the OS. Without this, DuckDB will claim most of free memory and one of the two processes will be killed.
+- **`memory_limit`** should be about 60% of physical RAM. On a 32 GB machine, 20 GB leaves enough for R and the OS. Without this, DuckDB will try to grab most of free memory and one of the two processes will be killed.
 - **`threads`** controls parallelism. For bulk ingest and scans, more is better up to core count; for small ad-hoc queries the default is already fine.
 - **`read_only = TRUE`** on an already-built database lets multiple sessions attach simultaneously. Useful when you iterate in one R session and render a Quarto document in another.
 

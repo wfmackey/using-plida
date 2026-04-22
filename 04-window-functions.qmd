@@ -174,18 +174,20 @@ Everything above ran happily on a panel of a few tens of millions of rows. Try t
 | ~700M                     | **OOM** for both `lag()` and self-join   |
 | ~3.5B                     | **OOM**, disk spill exceeded 166 GB      |
 
-The failure mode is the same whether you express it as `lag()` or as a self-join on `(person, week = week + 7 days)`:
+The failure mode is the same whether you use `lag()` or a self-join:
 
-- `lag()` fails because the sort required to define "one row before" is too large.
-- A self-join fails because the hash table on `(person, week)` does not fit in memory.
+- `lag()` fails because DuckDB needs to sort the whole table first (so it knows what "one row before" means), and the sort is too big.
+- The self-join fails because DuckDB needs to build a big lookup structure with the whole table in it, and that structure is too big.
 
-Both operations are O(N) or O(N log N) on the full table, and both blow the memory budget long before they finish. You need a strategy that works on slices.
+Both run out of memory long before they finish. You need a strategy that works on one slice of the data at a time.
 
-## The pattern: chunk by a person-hash bucket
+## The pattern: chunk by a group of people at a time
 
-Partition people into _n_ buckets using a hash of the person ID, and process each bucket independently. Because the window is `PARTITION BY person`, every person's entire timeline falls within one bucket — there are no cross-bucket edge effects. On STP we use 10 buckets, which gives ~70M rows per bucket and fits comfortably in the 24 GB budget.
+Instead of running `lag()` over the whole table, split the people into, say, 10 groups at write-time and process one group at a time. Each group is one-tenth of the total, which fits. Because the window is `partition by person`, every person's whole timeline is either in this group or it isn't — so there are no edge effects at the group boundaries.
 
-One practical wrinkle: the hash-and-modulus belongs in the **view definition**, not in each dbplyr query. If you try to express `hash(x) %% 10 == b` through dbplyr on every iteration, it translates to DuckDB's `FMOD()` (floating-point modulus) because `%%` is not guaranteed to be integer, and DuckDB cannot optimise that filter into the parquet scan — so each bucket reads the whole corpus. Bake an integer `bucket` column into the view once, and every downstream query is a trivial `filter(bucket == b)`.
+How do you split 30 million people into 10 roughly-equal groups? Take a hash of the person ID (a number that always gives the same output for the same input), and use `hash % 10` to assign each person a bucket from 0 to 9. The hash guarantees the buckets are roughly the same size and the assignment is deterministic.
+
+One practical wrinkle: it is worth computing that bucket column at view-definition time, not inside every query. If you try to write `filter(hash(synthetic_aeuid) %% 10 == 0)` inside the dbplyr pipeline, the translator emits a slightly different SQL expression that DuckDB cannot use to skip chunks, and each bucket ends up reading the whole file. Bake a plain integer `bucket` column into the view once, and every downstream query is a simple `filter(bucket == b)`.
 
 ```r
 library(duckdb); library(DBI); library(dplyr); library(dbplyr); library(purrr)
@@ -224,13 +226,13 @@ switches <- map(0:(n_buckets - 1), \(b) switches_one(b) |> compute()) |>
   compute(name = "switches", temporary = FALSE, overwrite = TRUE)
 ```
 
-Every analytical step is tidyverse. `compute()` materialises each bucket's output into a small DuckDB temp table; `reduce(union_all)` stacks the ten temp tables into one lazy query; the final `compute(name = ..., temporary = FALSE)` writes the result out as a persistent table. The only SQL on the page is `CREATE VIEW` — one line, once — because there is no tidyverse verb that registers a parquet glob as a DuckDB view.
+Every analytical step is tidyverse. `compute()` writes each bucket's result to a small temp table inside DuckDB; `reduce(union_all)` stacks the ten temp tables into a single lazy query; the final `compute(name = ..., temporary = FALSE)` writes the stacked result out as a persistent table. The only SQL on the page is `CREATE VIEW` — one line, once — because there is no tidyverse verb for "tell DuckDB that this parquet folder is now a table called `stp`".
 
-Each iteration processes only 1/n of the people. The loop takes about 20 seconds end-to-end for the full 700M-row year, and ~100 seconds for the full 3.5B-row five-year STP corpus. Per-bucket timings are in [A4 §Chunked approach](A4-window-function-benchmarks.qmd#the-chunked-approach).
+Each iteration handles one-tenth of the people. The loop takes about 20 seconds end-to-end for the full 700M-row year, and ~100 seconds for the full 3.5B-row five-year STP corpus. Per-bucket timings are in [A4](A4-window-function-benchmarks.qmd#the-chunked-approach).
 
 ::: {.callout-note}
-## Narrow the columns before the window
-The `select()` in `switches_one()` is not cosmetic. The sort buffer underneath `lag()` is proportional to the _row width_, not the column width — carrying 20 STP columns through a 70M-row window will OOM where 4 columns is comfortable. Project to exactly what the window and downstream filters need.
+## Keep only the columns you need before the window
+The `select()` in `switches_one()` is there for memory, not style. When DuckDB sorts the table for `lag()`, the memory it needs is proportional to how _wide_ each row is, not just how many rows there are. Carrying all 20 STP columns through a 70M-row window will run out of memory where carrying 4 columns is comfortable. Project down to exactly what the window and downstream filters need.
 :::
 
 ::: {.callout-tip}
@@ -259,7 +261,7 @@ stp_b |>
   filter(abn_hash_trunc != prev_employer)
 ```
 
-No `OVER (... ROWS BETWEEN ...)`, no `lag()`; just a plain inner join that DuckDB plans as a hash join.
+No window function at all — just an ordinary inner join.
 
 ## Cross-dataset temporal joins: round to a common grain
 
@@ -281,9 +283,9 @@ switches_m |>
 
 For the exact "nearest record strictly before this event" semantics, DuckDB has `ASOF JOIN`. It is one of the very few operations this site flags as genuinely SQL-only; if you need it, use it via `dbGetQuery()`. For almost every question that starts "the most recent record before…", the round-to-month form above is clearer and enough.
 
-## Beyond DuckDB: streaming processors
+## Beyond DuckDB: a streaming processor
 
-For production pipelines that need to process the full STP corpus on every data refresh, the next step up from chunked DuckDB is a custom streaming processor — typically in Rust, called from R via [extendr](https://extendr.github.io/rextendr/). A reader that walks sorted parquet files and maintains `(current_person, previous_employer)` state uses O(1) memory and runs at disk speed: no sorting, no hash tables, no chunking. It is overkill for exploratory work and exactly the right tool for a nightly pipeline.
+For production pipelines that process the full STP corpus on every refresh, the next step up from chunked DuckDB is to write a small program (usually in Rust, called from R via [extendr](https://extendr.github.io/rextendr/)) that walks the parquet files in person order and keeps track of the previous employer as it goes. It never sorts anything, never builds a lookup structure — it just reads, compares, writes. Fast, and uses essentially no memory. Overkill for exploratory work; exactly right for a pipeline that runs overnight every night.
 
 For everything on this site, chunked DuckDB with dbplyr is the recipe.
 

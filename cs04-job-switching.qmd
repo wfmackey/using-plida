@@ -66,12 +66,11 @@ register_view <- function(con, name, glob) {
 
 tic("Register views over parquet")
 
-# STP gets a `bucket` column baked in at view-definition time — so we can
-# `filter(bucket == b)` in dbplyr downstream. Doing the hash/modulus at
-# query time via `hash(x) %% 10` forces dbplyr to use FMOD (floating-
-# point modulus), which DuckDB cannot optimise away and which OOMs on
-# 70M-row LAG windows. Pre-computing as an integer column in the view
-# makes the per-bucket filter trivial.
+# STP gets an extra `bucket` column (0-9) computed once in the view.
+# We use this downstream to process one tenth of the people at a time.
+# Doing the same arithmetic inside the dbplyr pipeline on every
+# iteration confuses DuckDB's chunk-skipping, so the one-off view is
+# the right place to compute it.
 dbExecute(con, glue("CREATE OR REPLACE VIEW stp AS
   SELECT *, CAST(hash(SYNTHETIC_AEUID) % 10 AS INTEGER) AS bucket
   FROM read_parquet('{pq}/stp/stp-fy2122*.parquet')
@@ -89,7 +88,7 @@ ato_spine  <- tbl(con, "ato_spine")  |> rename_with(tolower)
 dhda_spine <- tbl(con, "dhda_spine") |> rename_with(tolower)
 ```
 
-Views are instant — DuckDB just records the parquet glob. The 697 million STP rows and 372 million MBS rows stay on disk until a query needs them. Every subsequent step uses plain dplyr.
+Views are instant — DuckDB just notes the parquet path. The 697 million STP rows and 372 million MBS rows stay on disk until a query needs them. Every step from here on is plain dplyr.
 
 ## Step 1: Derive employer switches from STP (chunked)
 
@@ -127,13 +126,13 @@ n_switchers <- stp_switches |> summarise(n = n_distinct(synthetic_aeuid)) |> pul
 cat("Switches:", comma(n_switches), "across", comma(n_switchers), "people\n")
 ```
 
-Everything there is tidyverse. `bucket_switches(b)` is a lazy dbplyr pipeline that reads ~70M STP rows for one bucket, narrows to four columns (crucial — the window sort buffer is proportional to row width, not table width), runs the `lag()` window partitioned by person, and keeps only the rows where the employer actually changed. `map()` runs the pipeline once per bucket, calling `compute()` to materialise each bucket's output as a small DuckDB temp table. `reduce(union_all)` stacks the ten temp tables into one lazy query, and the final `compute(name = "stp_switches", temporary = FALSE)` writes it out as a persistent table on the working database.
+Every step is tidyverse. `bucket_switches(b)` is a lazy pipeline that reads ~70M STP rows for one bucket, drops down to four columns (keeping memory small during the sort), applies `lag()` partitioned by person, and keeps only the rows where the employer actually changed. `map()` runs the pipeline once per bucket; `compute()` writes each bucket's result to a small temp table inside DuckDB. `reduce(union_all)` stacks the ten temp tables into one lazy query, and the final `compute(name = "stp_switches", temporary = FALSE)` writes the combined result out as a persistent table.
 
 ::: {.callout-note}
 ## Why chunking works
-The window function is partitioned by `synthetic_aeuid`. Each person's data is entirely within one hash bucket — no cross-bucket dependencies. The `hash(synthetic_aeuid) %% n_buckets == b` filter reduces each iteration to ~70M rows, and DuckDB's sort fits in 20 GB.
+`lag()` here is partitioned by `synthetic_aeuid`. Every person's timeline belongs to exactly one bucket, so processing one bucket at a time gives the same answer as doing all 30 million people at once. Each iteration only has to sort 70M rows, which fits in 20 GB.
 
-Without chunking, the same `lag()` on 700M rows exceeds 24 GB and is killed — even on a fresh database with only that table in it. We tested this exhaustively: see the full [failure log](A4-window-function-benchmarks.qmd#scaling-behaviour).
+Running `lag()` on the full 700M-row table blows past the memory budget and the process is killed — see [A4](A4-window-function-benchmarks.qmd#scaling-behaviour) for the full failure log.
 :::
 
 ::: {.callout-tip}
@@ -152,7 +151,7 @@ stp_b |>
   filter(abn_hash_trunc != prev_employer)
 ```
 
-This uses a hash join instead of a sort. At ~70M rows per bucket the timings are similar (~2–4s), but the self-join only works when the lag offset is a known, fixed time interval. `lag()` always looks back one _row_ regardless of the time gap. For STP (weekly by construction) they give the same result; for irregular data, use `lag()`. See the full [comparison](A4-window-function-benchmarks.qmd#how-the-self-join-works).
+This works because STP records are always exactly 7 days apart. It does _not_ work if the gap between records is irregular — for that, stick with `lag()`, which just looks back one row regardless of the time gap. At 70M rows per bucket the two approaches run in similar time (2-4s each). See [A4](A4-window-function-benchmarks.qmd#how-the-self-join-works) for the full comparison.
 :::
 
 ## Step 2: Derive health shocks from MBS
@@ -173,9 +172,9 @@ toc()
 cat("Person-months:", comma(mbs_monthly |> summarise(n = n()) |> pull(n)), "\n")
 ```
 
-`floor_date(dos, "month")` translates to DuckDB's `DATE_TRUNC('month', dos)`. The `summarise()` emits a `GROUP BY` over person and month, and `compute()` writes the result to a real DuckDB table so the next step can window over it without redoing the group-by.
+`floor_date(dos, "month")` rounds each service date down to the first of its month. `summarise()` aggregates claims per person per month. `compute()` writes the result out to a persistent table so the rolling window in the next step doesn't have to redo this group-by.
 
-Now the rolling window: for each person, compute the mean of `services` over the previous three months (excluding the current month), and flag months where services are at least double that trailing mean.
+Now the rolling window: for each person, compute the mean number of services over the previous three months (not counting the current month), and flag months where services are at least double that trailing mean.
 
 ```{r derive-shocks}
 tic("Flag health shocks (rolling window on person-months)")
@@ -200,11 +199,11 @@ cat("Health shock events:", comma(n_shocks),
     "across", comma(n_shocked), "people\n")
 ```
 
-`window_frame(-3, -1)` is the dbplyr idiom for SQL's `ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING`. Negative numbers are `PRECEDING`, positive are `FOLLOWING`, and `0` is the current row. Everything else is ordinary `group_by() |> window_order() |> mutate()`.
+`window_frame(from, to)` says which rows to include in the rolling window: `-3` means three rows back, `-1` means one row back. So `window_frame(-3, -1)` means "look at rows 3, 2, and 1 rows before the current row." Negative = earlier, positive = later, `0` = the current row. Everything else is ordinary `group_by() |> window_order() |> mutate()`.
 
 ::: {.callout-note}
-## Pre-aggregate, then window
-Collapsing 372M claims to ~206M person-months before windowing is what makes this step feasible. The rolling window runs on 206M rows, which fits in DuckDB's memory budget for the sort. Running the window directly on 372M raw claims would risk the same OOM we hit with STP.
+## Aggregate first, then window
+Collapsing 372M claims to ~206M person-months _before_ windowing is what makes this step work at all. 206M rows fit in memory for the sort. Running the rolling window directly on 372M raw claims would hit the same memory limit we hit with STP.
 :::
 
 ## Step 3: Link switches to shocks via spine
@@ -238,9 +237,9 @@ toc()
 post_shock
 ```
 
-Three joins, one windowed filter on dates, one groupby. No SQL.
+Three joins, one date filter, one groupby. No SQL.
 
-`shock_month + days(90L)` relies on dbplyr's lubridate translation to `INTERVAL` arithmetic in DuckDB — handy for "within three months of a reference date" comparisons without dropping to SQL.
+`shock_month + days(90L)` just works: dbplyr translates it to DuckDB's date arithmetic, so "within three months of the shock" is a plain `filter()`.
 
 ## Plot
 
@@ -309,19 +308,19 @@ Total: about 75 seconds. None of the steps exceeded 20 GB of RAM. The same pipel
 
 We tried four approaches before settling on views + chunked `lag()`. All of them — and the reason each failed or succeeded — are documented in the [window-function benchmarks](A4-window-function-benchmarks.qmd):
 
-- `lag()` on 700M rows: OOM (sort exceeds 24 GB)
-- Self-join on 700M rows: OOM (hash table exceeds 24 GB)
-- `lag()` on 70M rows (1 bucket): 2.3 seconds, success
+- `lag()` on 700M rows: out of memory (sort needs too much space)
+- Self-join on 700M rows: out of memory (lookup structure too big)
+- `lag()` on 70M rows (one bucket): 2.3 seconds, success
 - Self-join on 70M rows: 2.0 seconds, success
 - Chunked self-join, 10 buckets: 20 seconds, success
-- Chunked `lag()` on parquet views, 10 buckets: 45 seconds, success
+- Chunked `lag()` over parquet views, 10 buckets: 45 seconds, success
 - **Views + chunked `lag()` via dbplyr**: 75 seconds end-to-end, best total time
 
 ## Why this is all tidyverse
 
-Every analytical step above — the chunked `lag()`, the groupby to person-months, the trailing mean, the cross-spine double join, the date-window filter — is written in `group_by()` / `window_order()` / `window_frame()` / `mutate()` / `summarise()` / `inner_join()`. dbplyr translates those into the DuckDB SQL you would otherwise write by hand, and `show_query()` on any of the lazy tables shows the SQL it generated.
+Every analytical step above — the chunked `lag()`, the group-by to person-months, the trailing mean, the cross-spine double join, the date filter — is ordinary dplyr. dbplyr turns it into SQL behind the scenes. If you are ever curious what SQL it generated, call `show_query()` on the lazy table.
 
-The only SQL on this page is `register_view()` — one line per source table, because `CREATE VIEW` has no dbplyr verb. Every step after registration is dplyr.
+The only SQL on this page is `register_view()` — one line per source table, because there is no tidyverse equivalent of "tell DuckDB that this parquet folder is now a table called X". Everything after that is dplyr.
 
 ```{r disconnect}
 #| include: false

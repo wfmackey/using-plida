@@ -19,8 +19,8 @@ Each main chapter describes one piece of the larger-than-memory workflow and sho
 For PLIDA-style data on a machine with 32 GB of RAM:
 
 1.  **Store raw data as parquet.** Convert CSV → parquet with DuckDB's `read_csv_auto()` piped into `COPY ... TO parquet`. It is roughly 2× faster than the Arrow equivalent on this corpus and writes slightly smaller files. Keep zstd compression, medium row groups (`ROW_GROUP_SIZE 250000`), and medium-sized output files. See [A1](A1-reading-storing-benchmarks.qmd).
-2.  **Put the parquet into a materialised DuckDB database** once the workload becomes repetitive or join-heavy. Set `memory_limit` explicitly (~60 % of physical RAM). Views over parquet are fine for one-off exploration. See [A1](A1-reading-storing-benchmarks.qmd).
-3.  **Query the database through `dbplyr`.** Compose dplyr verbs against `tbl(con, "name")`, call `collect()` only on the final small result, and drop into raw SQL (`dbGetQuery`, or `sql(...)` inside `mutate()`) for anything dbplyr will not translate. See [A2](A2-data-manipulation-benchmarks.qmd).
+2.  **Put the parquet into a materialised DuckDB database** once the workload becomes repetitive or join-heavy. Set `memory_limit` explicitly (~60% of physical RAM). Views over parquet are fine for one-off exploration. See [A1](A1-reading-storing-benchmarks.qmd).
+3.  **Query the database through `dbplyr`.** Compose dplyr verbs against `tbl(con, "name")` and call `collect()` only on the final small result. Tidyverse all the way — raw SQL is almost never needed. See [A2](A2-data-manipulation-benchmarks.qmd).
 4.  **Use filtering joins (`semi_join`, `anti_join`) instead of `filter(x %in% ...)`** when the right-hand side is large. Push `filter()` upstream of every join. Expect DuckDB to handle 100M+ row joins that Arrow cannot finish on a 32 GB machine. See [A3](A3-join-benchmarks.qmd).
 5.  **For window functions on billion-row panel data, chunk by a person-hash bucket.** A single `LAG()` over 700M STP rows does not fit; ten independent calls over 70M-row buckets complete in about 20 seconds. See [A4](A4-window-function-benchmarks.qmd).
 
@@ -28,13 +28,15 @@ The rest of this site walks through each of those recommendations in turn.
 
 ## A very short introduction to DuckDB
 
-[DuckDB](https://duckdb.org/) is an in-process analytical database — the same idea as SQLite, but vectorised and columnar rather than row-based. You can think of it as a SQL engine that lives inside your R session: no server to stand up, no network, no client-server protocol. A database is a single file on disk, or it can run entirely in memory.
+[DuckDB](https://duckdb.org/) is a database that runs inside your R session. No server to start, no login, no network. A DuckDB database is a single file on disk (here, `plida_tables.duckdb`) that you open from R the same way you would open a connection to any database, and close when you're done. It is the same general idea as SQLite — if you have used that for small projects, DuckDB will feel familiar — but it is designed for the analysis workload we do every day: big tables, filters and groupbys, joins across tables.
 
-For larger-than-memory PLIDA work three properties matter:
+Three things about DuckDB matter for PLIDA work, in plain English.
 
-- **Vectorised, columnar execution.** DuckDB operates on batches of column values at a time. Scans, filters, aggregations and joins are all expressed as operators over columnar chunks. That is what makes it competitive with — and usually faster than — `data.table` on in-memory work, and it is what lets it stream through parquet without materialising whole tables.
-- **A real query optimiser with spill-to-disk.** DuckDB plans queries, pushes filters into the parquet reader, and falls back to the buffer pool when a hash table does not fit in RAM. On a 32 GB machine that is the difference between a 372-million-row join completing in a few seconds and the process being killed by the OS.
-- **First-class parquet support.** DuckDB can read parquet directly, write parquet out, or ingest it into its own storage. Parquet stays the canonical format on disk and DuckDB is one of several engines that can read it.
+- **It only reads the columns your query touches.** When you write `summarise(services = sum(numserv))` against a 370-million-row MBS table, DuckDB reads the `numserv` column from disk and ignores everything else. With `read_csv()` on a tibble, R reads every column of every row whether you use it or not. That's the biggest reason the examples in this book go from "takes 35 seconds and 14 GB of RAM" to "takes under a second and uses almost no RAM" without any cleverness on your part — just the storage format plus the query engine.
+- **It works when the data is bigger than your RAM.** A join or a sort that cannot fit entirely in memory normally kills your R session (you see "cannot allocate vector of size..."). DuckDB notices this is happening and starts temporarily writing pieces of the intermediate work out to a scratch directory on disk. The query finishes, just a bit slower. Without this feature, a three-way join on the 372-million-row MBS table on a 32 GB laptop is impossible.
+- **It reads parquet files directly.** You can either point DuckDB at a parquet file (a zero-copy "view") or copy the parquet into a DuckDB table (slightly faster for repeated queries; see [Reading and storing](01-reading-storing.qmd)). Either way, parquet stays the canonical on-disk format — other R packages (`arrow`), Python, and so on can all read the same files.
+
+The only Rule of DuckDB Club worth memorising is: **set the memory limit explicitly** (below), and **always `read_only = TRUE`** when you are analysing rather than building the database.
 
 From R there are two main interfaces to DuckDB:
 
@@ -63,7 +65,7 @@ You can see the SQL that dbplyr generated for any lazy query with `show_query()`
 
 Two knobs are worth setting on every connection:
 
-- **`SET memory_limit = '20GB'`** (or roughly 60 % of physical RAM). Without this, DuckDB will happily claim most of free memory, collide with R's heap, and the OS will kill one of them.
+- **`SET memory_limit = '20GB'`** (or roughly 60% of physical RAM). Without this, DuckDB will happily claim most of free memory, collide with R, and the OS will kill one of them.
 - **`read_only = TRUE`** when attaching an already-built database for analysis. Multiple R sessions can attach the same `.duckdb` file read-only simultaneously — useful when you iterate in one session and render a Quarto document in another.
 
 The rest of the site assumes this is the default query engine and treats Arrow, dplyr-on-tibbles, and data.table as alternatives you reach for in specific situations.
